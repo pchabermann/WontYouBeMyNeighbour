@@ -1,0 +1,1 @@
+{"branch":"ospf-agent-main","created_at":"2026-01-15T14:40:42","kind":"auto","message":"Turn 3 - Added point-to-multipoint network type support","meta":{},"parents":["c45c1949a91351ca909edb5ca76ddb65becfc9992bbae9872da2c38d4ffeea85"],"schema":"gait.commit.v0","snapshot_id":null,"turn_ids":["86def4ebe64dac56e2b33c86afdd39272f66d05a1c912bd7b4e0f8c63c7c8837"]}

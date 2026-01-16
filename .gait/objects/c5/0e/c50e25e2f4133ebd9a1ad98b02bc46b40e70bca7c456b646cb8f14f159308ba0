@@ -1,0 +1,1 @@
+{"branch":"lsa-flooding-complete","created_at":"2026-01-15T21:42:31","kind":"auto","message":"Turn 13: LSU processing with automatic flooding to neighbors","meta":{},"parents":["a7aa97466a47b8ce8c6ed1ab9fc4b6cc7a1a315028f5ffde6b18b252483600be"],"schema":"gait.commit.v0","snapshot_id":null,"turn_ids":["8d1b973f2cb0d27baf8d5205fbb5d7397dbec1218a0895908865387a2e64d0f0"]}

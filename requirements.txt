@@ -1,0 +1,13 @@
+# Won't You Be My Neighbor - OSPF Agent Dependencies
+
+# Packet crafting and parsing
+scapy>=2.5.0
+
+# Graph algorithms for SPF calculation
+networkx>=3.0
+
+# Network interface information
+netifaces>=0.11.0
+
+# Testing (optional)
+pytest>=7.0.0
