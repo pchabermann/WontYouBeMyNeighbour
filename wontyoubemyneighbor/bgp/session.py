@@ -25,6 +25,7 @@ from .fsm import BGPFSM, BGPEvent
 from .rib import AdjRIBIn, LocRIB, AdjRIBOut, BGPRoute
 from .capabilities import CapabilityManager, build_capability_list, parse_capabilities_from_open
 from .attributes import PathAttribute
+from .flap_damping import RouteFlapDamping, FlapDampingConfig
 
 
 @dataclass
@@ -55,6 +56,21 @@ class BGPSessionConfig:
     # Policy
     import_policy: Optional[str] = None
     export_policy: Optional[str] = None
+
+    # Route Flap Damping
+    enable_flap_damping: bool = False
+    flap_damping_config: Optional[FlapDampingConfig] = None
+
+    # Graceful Restart
+    enable_graceful_restart: bool = False
+    graceful_restart_time: int = 120  # Restart time in seconds
+
+    # RPKI Validation
+    enable_rpki_validation: bool = False
+    rpki_reject_invalid: bool = False  # Reject invalid routes
+
+    # FlowSpec
+    enable_flowspec: bool = False
 
 
 class BGPSession:
@@ -109,6 +125,23 @@ class BGPSession:
         self.adj_rib_in = AdjRIBIn()
         self.adj_rib_out = AdjRIBOut()
         self.loc_rib: Optional[LocRIB] = None  # Shared Loc-RIB (set by BGPAgent)
+
+        # Route Flap Damping
+        self.flap_damping: Optional[RouteFlapDamping] = None
+        if config.enable_flap_damping:
+            self.flap_damping = RouteFlapDamping(config.flap_damping_config)
+            self.logger.info("Route flap damping ENABLED")
+
+        # Graceful Restart (set by BGPAgent)
+        self.graceful_restart_manager: Optional['GracefulRestartManager'] = None
+
+        # RPKI Validator (set by BGPAgent)
+        self.rpki_validator: Optional['RPKIValidator'] = None
+
+        # FlowSpec Manager (set by BGPAgent)
+        self.flowspec_manager: Optional['FlowspecManager'] = None
+        if config.enable_flowspec:
+            self.logger.info("BGP FlowSpec ENABLED (requires SAFI 133/134 support)")
 
         # Statistics
         self.stats = {
@@ -442,24 +475,133 @@ class BGPSession:
         """Process UPDATE message"""
         self.stats['updates_received'] += 1
 
-        # Process withdrawn routes
+        # Check for End-of-RIB marker (RFC 4724)
+        # IPv4: UPDATE with no withdrawn routes, no NLRI, and empty path attributes
+        is_end_of_rib_ipv4 = (
+            not message.withdrawn_routes and
+            not message.nlri and
+            not message.path_attributes
+        )
+
+        if is_end_of_rib_ipv4:
+            self.logger.info(f"Received End-of-RIB marker for IPv4 unicast from {self.config.peer_ip}")
+            if self.graceful_restart_manager and self.config.enable_graceful_restart:
+                stale_routes = self.graceful_restart_manager.handle_end_of_rib(
+                    self.config.peer_ip, AFI_IPV4, SAFI_UNICAST
+                )
+                # Remove stale routes that weren't refreshed
+                for prefix in stale_routes:
+                    self.adj_rib_in.remove_route(prefix, self.peer_id)
+                    self.logger.debug(f"Removed stale route {prefix}")
+            return
+
+        # Process IPv4 withdrawn routes
         if message.withdrawn_routes:
-            self.logger.debug(f"Withdrawn routes: {len(message.withdrawn_routes)}")
+            self.logger.debug(f"IPv4 withdrawn routes: {len(message.withdrawn_routes)}")
             for prefix in message.withdrawn_routes:
+                # Track flap if damping enabled
+                if self.flap_damping:
+                    self.flap_damping.route_withdrawn(prefix)
+
                 self.adj_rib_in.remove_route(prefix, self.peer_id)
                 self.stats['routes_received'] -= 1
 
-        # Process advertised routes
+        # Process IPv4 advertised routes
         if message.nlri:
-            self.logger.debug(f"Advertised routes: {len(message.nlri)}, "
+            self.logger.debug(f"IPv4 advertised routes: {len(message.nlri)}, "
                             f"attributes: {len(message.path_attributes)}")
 
             # Build route with path attributes
             for prefix in message.nlri:
-                route = self._build_route_from_update(prefix, message.path_attributes)
+                # Check flap damping suppression
+                if self.flap_damping:
+                    is_suppressed = self.flap_damping.route_announced(prefix, attribute_changed=False)
+                    if is_suppressed:
+                        self.logger.warning(f"Route {prefix} is SUPPRESSED by flap damping - not installing")
+                        continue
+
+                route = self._build_route_from_update(prefix, message.path_attributes, AFI_IPV4)
                 if route:
+                    # RPKI validation
+                    if self.rpki_validator and self.config.enable_rpki_validation:
+                        origin_as = self._get_origin_as(route)
+                        if origin_as is not None:
+                            validation_state = self.rpki_validator.validate_route(
+                                route.prefix.split('/')[0],
+                                route.prefix_len,
+                                origin_as
+                            )
+                            route.validation_state = validation_state
+
+                            # Reject invalid routes if configured
+                            if self.config.rpki_reject_invalid and validation_state == 1:  # INVALID
+                                self.logger.warning(f"REJECTING RPKI-invalid route {prefix} from AS{origin_as}")
+                                continue
+
                     self.adj_rib_in.add_route(route)
                     self.stats['routes_received'] += 1
+
+                    # Mark route as refreshed if in graceful restart
+                    if self.graceful_restart_manager and self.config.enable_graceful_restart:
+                        self.graceful_restart_manager.route_refreshed(self.config.peer_ip, prefix)
+
+        # Process MP_REACH_NLRI for IPv6 (and other address families)
+        if ATTR_MP_REACH_NLRI in message.path_attributes:
+            mp_reach = message.path_attributes[ATTR_MP_REACH_NLRI]
+            if mp_reach.afi == AFI_IPV6 and mp_reach.safi == SAFI_UNICAST:
+                self.logger.info(f"IPv6 MP_REACH_NLRI: {len(mp_reach.nlri)} routes, next_hop={mp_reach.next_hop}")
+
+                # Add next hop to attributes for route building
+                modified_attrs = message.path_attributes.copy()
+
+                for prefix in mp_reach.nlri:
+                    # Check flap damping suppression
+                    if self.flap_damping:
+                        is_suppressed = self.flap_damping.route_announced(prefix, attribute_changed=False)
+                        if is_suppressed:
+                            self.logger.warning(f"IPv6 route {prefix} is SUPPRESSED by flap damping - not installing")
+                            continue
+
+                    route = self._build_route_from_update(prefix, modified_attrs, AFI_IPV6, mp_reach.next_hop)
+                    if route:
+                        # RPKI validation
+                        if self.rpki_validator and self.config.enable_rpki_validation:
+                            origin_as = self._get_origin_as(route)
+                            if origin_as is not None:
+                                validation_state = self.rpki_validator.validate_route(
+                                    route.prefix.split('/')[0],
+                                    route.prefix_len,
+                                    origin_as
+                                )
+                                route.validation_state = validation_state
+
+                                # Reject invalid routes if configured
+                                if self.config.rpki_reject_invalid and validation_state == 1:  # INVALID
+                                    self.logger.warning(f"REJECTING RPKI-invalid IPv6 route {prefix} from AS{origin_as}")
+                                    continue
+
+                        self.adj_rib_in.add_route(route)
+                        self.stats['routes_received'] += 1
+                        self.logger.info(f"Added IPv6 route: {prefix} via {mp_reach.next_hop}")
+
+                        # Mark route as refreshed if in graceful restart
+                        if self.graceful_restart_manager and self.config.enable_graceful_restart:
+                            self.graceful_restart_manager.route_refreshed(self.config.peer_ip, prefix)
+
+        # Process MP_UNREACH_NLRI for IPv6 withdrawals
+        if ATTR_MP_UNREACH_NLRI in message.path_attributes:
+            mp_unreach = message.path_attributes[ATTR_MP_UNREACH_NLRI]
+            if mp_unreach.afi == AFI_IPV6 and mp_unreach.safi == SAFI_UNICAST:
+                self.logger.info(f"IPv6 MP_UNREACH_NLRI: {len(mp_unreach.withdrawn_routes)} withdrawn")
+
+                for prefix in mp_unreach.withdrawn_routes:
+                    # Track flap if damping enabled
+                    if self.flap_damping:
+                        self.flap_damping.route_withdrawn(prefix)
+
+                    self.adj_rib_in.remove_route(prefix, self.peer_id)
+                    self.stats['routes_received'] -= 1
+                    self.logger.info(f"Withdrew IPv6 route: {prefix}")
 
     async def _process_keepalive(self, message: BGPKeepalive) -> None:
         """Process KEEPALIVE message"""
@@ -482,13 +624,16 @@ class BGPSession:
         # Re-send all routes in Adj-RIB-Out
         # This will be implemented when we add the advertisement logic
 
-    def _build_route_from_update(self, prefix: str, attributes: Dict[int, Any]) -> Optional[BGPRoute]:
+    def _build_route_from_update(self, prefix: str, attributes: Dict[int, Any],
+                                 afi: int = AFI_IPV4, mp_next_hop: Optional[str] = None) -> Optional[BGPRoute]:
         """
         Build BGPRoute from UPDATE message
 
         Args:
             prefix: Prefix string
             attributes: Path attributes dictionary (type_code -> value)
+            afi: Address Family Identifier (AFI_IPV4 or AFI_IPV6)
+            mp_next_hop: Multiprotocol next hop (for IPv6)
 
         Returns:
             BGPRoute or None
@@ -500,20 +645,24 @@ class BGPSession:
                 prefix_len = int(prefix_len_str)
             else:
                 prefix_str = prefix
-                prefix_len = 32  # Default for IPv4
+                prefix_len = 32 if afi == AFI_IPV4 else 128
 
-            # attributes is already a dict from UPDATE decode
-            # No need to rebuild it
+            # For IPv6, store the next hop from MP_REACH_NLRI in path attributes
+            # so it can be retrieved later for route installation
+            route_attributes = attributes.copy()
+            if afi == AFI_IPV6 and mp_next_hop:
+                # Store IPv6 next hop as a pseudo-attribute for easy access
+                route_attributes['_ipv6_next_hop'] = mp_next_hop
 
             # Create route
             route = BGPRoute(
                 prefix=prefix,
                 prefix_len=prefix_len,
-                path_attributes=attributes,
+                path_attributes=route_attributes,
                 peer_id=self.peer_id,
                 peer_ip=self.config.peer_ip,
                 timestamp=time.time(),
-                afi=AFI_IPV4,
+                afi=afi,
                 safi=SAFI_UNICAST
             )
 
@@ -528,11 +677,20 @@ class BGPSession:
         # Enable IPv4 unicast capability (required for route exchange with FRR)
         self.capabilities.enable_multiprotocol(AFI_IPV4, SAFI_UNICAST)
 
-        # Keep other capabilities disabled for now to avoid encoding issues
-        # TODO: Re-enable these after verifying IPv4 unicast works:
-        # self.capabilities.enable_four_octet_as()
-        # self.capabilities.enable_route_refresh()
-        # self.capabilities.enable_multiprotocol(AFI_IPV6, SAFI_UNICAST)
+        # Enable additional standard capabilities
+        self.capabilities.enable_four_octet_as()
+        self.capabilities.enable_route_refresh()
+
+        # Enable IPv6 unicast for dual-stack support
+        self.capabilities.enable_multiprotocol(AFI_IPV6, SAFI_UNICAST)
+
+        # Enable graceful restart if configured
+        if self.config.enable_graceful_restart:
+            self.capabilities.enable_graceful_restart(
+                restart_time=self.config.graceful_restart_time,
+                restart_state=False
+            )
+            self.logger.info(f"Graceful restart enabled (restart_time={self.config.graceful_restart_time}s)")
 
         self.logger.info(f"Configured {len(self.capabilities.local_capabilities)} capabilities: {list(self.capabilities.local_capabilities.keys())}")
 
@@ -553,6 +711,11 @@ class BGPSession:
             self.stats['established_time'] = time.time()
             self.logger.info(f"BGP session ESTABLISHED with {self.config.peer_ip}")
 
+            # Notify graceful restart manager
+            if self.graceful_restart_manager and self.config.enable_graceful_restart:
+                supports_gr = self.capabilities.supports_graceful_restart()
+                self.graceful_restart_manager.peer_session_up(self.config.peer_ip, supports_gr)
+
             # Call on_established callback if registered
             if hasattr(self, 'on_established') and self.on_established:
                 self.on_established()
@@ -564,6 +727,23 @@ class BGPSession:
                 self.stats['uptime'] += uptime
                 self.stats['established_time'] = None
             self.logger.warning(f"BGP session DOWN with {self.config.peer_ip}")
+
+            # Handle graceful restart - mark routes as stale
+            if self.graceful_restart_manager and self.config.enable_graceful_restart:
+                # Get all routes from this peer's Adj-RIB-In
+                routes = {}
+                for prefix in self.adj_rib_in.get_prefixes():
+                    prefix_routes = self.adj_rib_in.get_routes(prefix)
+                    for route in prefix_routes:
+                        if route.source == self.peer_id:
+                            routes[prefix] = route
+
+                # Notify graceful restart manager
+                self.graceful_restart_manager.peer_session_down(
+                    self.config.peer_ip,
+                    routes,
+                    restart_time=self.config.graceful_restart_time
+                )
 
     def _on_fsm_send_open(self) -> None:
         """FSM callback to send OPEN message"""
@@ -613,6 +793,26 @@ class BGPSession:
     async def _disconnect(self) -> None:
         """Close TCP connection"""
         await self._close_connection()
+
+    def _get_origin_as(self, route: 'BGPRoute') -> Optional[int]:
+        """
+        Extract origin AS from route's AS_PATH attribute
+
+        Args:
+            route: BGP route
+
+        Returns:
+            Origin AS number or None
+        """
+        if ATTR_AS_PATH not in route.path_attributes:
+            return None
+
+        as_path_attr = route.path_attributes[ATTR_AS_PATH]
+        if hasattr(as_path_attr, 'as_path') and as_path_attr.as_path:
+            # AS_PATH is a list of AS numbers, origin is the last one
+            return as_path_attr.as_path[-1]
+
+        return None
 
     def is_established(self) -> bool:
         """Check if session is in Established state"""

@@ -936,6 +936,17 @@ async def run_unified_agent(args: argparse.Namespace):
                 bgp_speaker.enable_route_reflection(cluster_id=cluster_id)
                 logger.info(f"BGP route reflection enabled (cluster ID: {cluster_id})")
 
+            # Configure flap damping if enabled
+            flap_config = None
+            if args.bgp_enable_flap_damping:
+                from bgp.flap_damping import FlapDampingConfig
+                flap_config = FlapDampingConfig()
+                flap_config.suppress_threshold = args.bgp_flap_suppress_threshold
+                flap_config.reuse_threshold = args.bgp_flap_reuse_threshold
+                flap_config.set_half_life(args.bgp_flap_half_life)
+                logger.info(f"BGP flap damping enabled: suppress={flap_config.suppress_threshold}, "
+                           f"reuse={flap_config.reuse_threshold}, half-life={flap_config.half_life}s")
+
             # Add BGP peers
             if args.bgp_peers:
                 for i, peer_ip in enumerate(args.bgp_peers):
@@ -964,8 +975,24 @@ async def run_unified_agent(args: argparse.Namespace):
                         passive=passive,
                         route_reflector_client=rr_client,
                         hold_time=args.bgp_hold_time,
-                        connect_retry_time=args.bgp_connect_retry
+                        connect_retry_time=args.bgp_connect_retry,
+                        enable_flap_damping=args.bgp_enable_flap_damping,
+                        flap_damping_config=flap_config,
+                        enable_graceful_restart=args.bgp_enable_graceful_restart,
+                        graceful_restart_time=args.bgp_graceful_restart_time,
+                        enable_rpki_validation=args.bgp_enable_rpki,
+                        rpki_reject_invalid=args.bgp_rpki_reject_invalid,
+                        enable_flowspec=args.bgp_enable_flowspec
                     )
+
+            # Load RPKI ROAs if specified
+            if args.bgp_enable_rpki and args.bgp_rpki_roa_file:
+                logger.info(f"Loading RPKI ROAs from {args.bgp_rpki_roa_file}...")
+                roa_count = bgp_speaker.agent.rpki_validator.load_roas_from_file(args.bgp_rpki_roa_file)
+                if roa_count > 0:
+                    logger.info(f"  ✓ Loaded {roa_count} ROAs")
+                else:
+                    logger.warning(f"  ⚠ No ROAs loaded from {args.bgp_rpki_roa_file}")
 
             # Start BGP speaker
             await bgp_speaker.start()
@@ -1189,6 +1216,29 @@ Notes:
                        help="BGP Statistics display interval in seconds (default: 30)")
     bgp_group.add_argument("--bgp-network", dest="bgp_networks", action="append",
                        help="BGP Network to originate/advertise (can be specified multiple times)")
+    bgp_group.add_argument("--bgp-enable-flap-damping", action="store_true",
+                       help="Enable BGP route flap damping (RFC 2439)")
+    bgp_group.add_argument("--bgp-flap-suppress-threshold", type=int, default=3000,
+                       help="Flap damping suppress threshold (default: 3000)")
+    bgp_group.add_argument("--bgp-flap-reuse-threshold", type=int, default=750,
+                       help="Flap damping reuse threshold (default: 750)")
+    bgp_group.add_argument("--bgp-flap-half-life", type=int, default=900,
+                       help="Flap damping half-life in seconds (default: 900 = 15 minutes)")
+
+    bgp_group.add_argument("--bgp-enable-graceful-restart", action="store_true",
+                       help="Enable BGP graceful restart (RFC 4724)")
+    bgp_group.add_argument("--bgp-graceful-restart-time", type=int, default=120,
+                       help="Graceful restart time in seconds (default: 120)")
+
+    bgp_group.add_argument("--bgp-enable-rpki", action="store_true",
+                       help="Enable RPKI route origin validation (RFC 6811)")
+    bgp_group.add_argument("--bgp-rpki-reject-invalid", action="store_true",
+                       help="Reject RPKI-invalid routes (default: accept with invalid state)")
+    bgp_group.add_argument("--bgp-rpki-roa-file", type=str,
+                       help="Load ROAs from JSON file")
+
+    bgp_group.add_argument("--bgp-enable-flowspec", action="store_true",
+                       help="Enable BGP FlowSpec for traffic filtering (RFC 5575)")
 
     args = parser.parse_args()
 

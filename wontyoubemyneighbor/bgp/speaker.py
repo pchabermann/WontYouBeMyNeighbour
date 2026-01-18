@@ -82,7 +82,14 @@ class BGPSpeaker:
                  connect_retry_time: int = 120,
                  route_reflector_client: bool = False,
                  import_policy: Optional[Policy] = None,
-                 export_policy: Optional[Policy] = None) -> None:
+                 export_policy: Optional[Policy] = None,
+                 enable_flap_damping: bool = False,
+                 flap_damping_config: Optional[object] = None,
+                 enable_graceful_restart: bool = False,
+                 graceful_restart_time: int = 120,
+                 enable_rpki_validation: bool = False,
+                 rpki_reject_invalid: bool = False,
+                 enable_flowspec: bool = False) -> None:
         """
         Add BGP peer
 
@@ -98,6 +105,13 @@ class BGPSpeaker:
             route_reflector_client: Is this peer a route reflector client (default: False)
             import_policy: Import policy for this peer
             export_policy: Export policy for this peer
+            enable_flap_damping: Enable route flap damping (default: False)
+            flap_damping_config: Flap damping configuration (default: None, uses RFC defaults)
+            enable_graceful_restart: Enable graceful restart (default: False)
+            graceful_restart_time: Restart time in seconds (default: 120)
+            enable_rpki_validation: Enable RPKI route origin validation (default: False)
+            rpki_reject_invalid: Reject RPKI-invalid routes (default: False)
+            enable_flowspec: Enable BGP FlowSpec (default: False)
         """
         if not local_ip:
             local_ip = self.router_id
@@ -114,7 +128,14 @@ class BGPSpeaker:
             hold_time=hold_time,
             connect_retry_time=connect_retry_time,
             passive=passive,
-            route_reflector_client=route_reflector_client
+            route_reflector_client=route_reflector_client,
+            enable_flap_damping=enable_flap_damping,
+            flap_damping_config=flap_damping_config,
+            enable_graceful_restart=enable_graceful_restart,
+            graceful_restart_time=graceful_restart_time,
+            enable_rpki_validation=enable_rpki_validation,
+            rpki_reject_invalid=rpki_reject_invalid,
+            enable_flowspec=enable_flowspec
         )
 
         # Add peer to agent
