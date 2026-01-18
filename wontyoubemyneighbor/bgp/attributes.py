@@ -213,6 +213,19 @@ class ASPathAttribute(PathAttribute):
                 return True
         return False
 
+    @property
+    def as_path(self) -> List[int]:
+        """
+        Get flattened AS_PATH as a list of AS numbers
+
+        Returns all AS numbers from all AS_SEQUENCE segments in order.
+        AS_SET segments are included but order within set is arbitrary.
+        """
+        path = []
+        for seg_type, as_list in self.segments:
+            path.extend(as_list)
+        return path
+
     def __repr__(self) -> str:
         parts = []
         for seg_type, as_list in self.segments:

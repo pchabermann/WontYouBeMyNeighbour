@@ -42,6 +42,9 @@ class BGPRoute:
     # Source
     source: str = "peer"  # "peer", "local", "aggregate"
 
+    # RPKI validation state (0=Valid, 1=Invalid, 2=NotFound)
+    validation_state: Optional[int] = None
+
     def __post_init__(self):
         """Post-initialization to parse prefix length"""
         if '/' in self.prefix:

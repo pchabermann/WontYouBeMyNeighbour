@@ -24,6 +24,9 @@ from .rib import LocRIB, BGPRoute
 from .path_selection import BestPathSelector
 from .policy import PolicyEngine, Policy
 from .route_reflection import RouteReflector
+from .graceful_restart import GracefulRestartManager
+from .rpki import RPKIValidator
+from .flowspec import FlowspecManager
 from .messages import BGPUpdate, BGPNotification
 from .attributes import *
 
@@ -70,6 +73,15 @@ class BGPAgent:
 
         # Route reflector (optional)
         self.route_reflector: Optional[RouteReflector] = None
+
+        # Graceful restart manager
+        self.graceful_restart = GracefulRestartManager(router_id)
+
+        # RPKI validator
+        self.rpki_validator = RPKIValidator()
+
+        # FlowSpec manager
+        self.flowspec_manager = FlowspecManager()
 
         # TCP listener
         self.server: Optional[asyncio.Server] = None
@@ -198,6 +210,9 @@ class BGPAgent:
         # Create session
         session = BGPSession(config)
         session.loc_rib = self.loc_rib  # Share Loc-RIB
+        session.graceful_restart_manager = self.graceful_restart  # Share graceful restart manager
+        session.rpki_validator = self.rpki_validator  # Share RPKI validator
+        session.flowspec_manager = self.flowspec_manager  # Share FlowSpec manager
 
         self.sessions[peer_ip] = session
 
