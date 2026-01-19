@@ -2,13 +2,15 @@
 Google Gemini Provider
 
 Implements Google Gemini API integration for wontyoubemyneighbor agentic layer.
+Uses the new google.genai package (non-deprecated).
 """
 
 from typing import List, Dict, Any, Optional
 import os
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
@@ -19,15 +21,15 @@ from .interface import BaseLLMProvider, ConversationMessage
 class GeminiProvider(BaseLLMProvider):
     """Google Gemini provider implementation"""
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-pro"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "gemini-2.0-flash-exp"):
         super().__init__(api_key, model)
-        self.model = model or "gemini-pro"
+        self.model = model or "gemini-2.0-flash-exp"
         self.client = None
 
     async def initialize(self) -> bool:
         """Initialize Google Gemini client"""
         if not GEMINI_AVAILABLE:
-            print("[Gemini] Google GenerativeAI library not installed. Install with: pip install google-generativeai")
+            print("[Gemini] Google GenAI library not installed. Install with: pip install google-genai")
             return False
 
         # Get API key from parameter or environment
@@ -37,10 +39,12 @@ class GeminiProvider(BaseLLMProvider):
             return False
 
         try:
-            genai.configure(api_key=api_key)
-            self.client = genai.GenerativeModel(self.model)
+            self.client = genai.Client(api_key=api_key)
             # Test with simple generation
-            response = self.client.generate_content("test")
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents="test"
+            )
             self.available = True
             return True
         except Exception as e:
@@ -74,15 +78,16 @@ class GeminiProvider(BaseLLMProvider):
         full_prompt = "\n".join(prompt_parts)
 
         try:
-            # Configure generation
-            generation_config = {
-                "temperature": temperature,
-                "max_output_tokens": max_tokens,
-            }
+            # Configure generation with new API
+            generate_content_config = types.GenerateContentConfig(
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+            )
 
-            response = self.client.generate_content(
-                full_prompt,
-                generation_config=generation_config
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=full_prompt,
+                config=generate_content_config
             )
             return response.text
         except Exception as e:
