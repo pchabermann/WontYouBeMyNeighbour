@@ -865,6 +865,7 @@ async def run_unified_agent(args: argparse.Namespace):
     ospfv3_speaker = None
     bgp_speaker = None
     agentic_api_server = None
+    agentic_bridge = None
     tasks = []
 
     # Determine what protocols to run
@@ -1107,7 +1108,14 @@ async def run_unified_agent(args: argparse.Namespace):
             from agentic.integration.bridge import AgenticBridge
             from agentic.integration.ospf_connector import OSPFConnector
             from agentic.integration.bgp_connector import BGPConnector
-            from agentic.api.server import AgenticAPIServer
+            from agentic.api.server import create_api_server
+
+            try:
+                import uvicorn
+            except ImportError:
+                logger.error("uvicorn not installed. Install with: pip install uvicorn")
+                logger.error("Agentic interface requires uvicorn to run the API server")
+                raise
 
             # Determine Ralph ID
             ralph_id = args.ralph_id if args.ralph_id else f"ralph-{args.router_id.replace('.', '-')}"
@@ -1142,15 +1150,21 @@ async def run_unified_agent(args: argparse.Namespace):
             await bridge.initialize()
             await bridge.start()
 
-            # Create and start API server
-            agentic_api_server = AgenticAPIServer(
-                bridge=bridge,
+            # Create API server
+            api, server_config = create_api_server(
+                bridge,
                 host=args.agentic_api_host,
                 port=args.agentic_api_port
             )
 
+            # Store for cleanup
+            agentic_api_server = api
+            agentic_bridge = bridge
+
             # Start API server as background task
-            tasks.append(asyncio.create_task(agentic_api_server.start()))
+            config = uvicorn.Config(**server_config)
+            server = uvicorn.Server(config)
+            tasks.append(asyncio.create_task(server.serve()))
 
             logger.info(f"✓ Agentic LLM Interface API started at http://{args.agentic_api_host}:{args.agentic_api_port}")
             logger.info(f"  Documentation: http://{args.agentic_api_host}:{args.agentic_api_port}/docs")
@@ -1191,7 +1205,11 @@ async def run_unified_agent(args: argparse.Namespace):
 
         if agentic_api_server:
             logger.info("Stopping Agentic API server...")
-            await agentic_api_server.stop()
+            # uvicorn server cleanup handled by task cancellation
+
+        if agentic_bridge:
+            logger.info("Stopping Agentic bridge...")
+            await agentic_bridge.stop()
 
         logger.info("Shutdown complete")
 
