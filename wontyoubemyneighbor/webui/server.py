@@ -503,7 +503,7 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
 
         # Collect interface information from multiple sources
         def add_interface(iface):
-            status["interfaces"].append({
+            iface_data = {
                 "id": iface.get('id') or iface.get('n'),
                 "name": iface.get('n') or iface.get('name'),
                 "type": iface.get('t') or iface.get('type', 'eth'),
@@ -511,7 +511,11 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
                 "status": iface.get('s') or iface.get('status', 'up'),
                 "mtu": iface.get('mtu', 1500),
                 "description": iface.get('description', '')
-            })
+            }
+            # Include tunnel configuration if present (for GRE interfaces)
+            if 'tun' in iface:
+                iface_data['tun'] = iface['tun']
+            status["interfaces"].append(iface_data)
 
         # Source 1: asi_app.interfaces
         if hasattr(asi_app, 'interfaces') and asi_app.interfaces:
@@ -721,7 +725,478 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
         except Exception:
             pass
 
+        # GRE Tunnel status - RFC 2784/2890
+        try:
+            from gre import get_gre_manager
+            gre_agent_id = os.environ.get("ASI_AGENT_ID", "local")
+            manager = get_gre_manager(gre_agent_id)
+            if manager:
+                status["gre"] = {
+                    "enabled": True,
+                    "tunnel_count": manager.tunnel_count,
+                    "tunnels": manager.list_tunnels()
+                }
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"GRE status error: {e}")
+            pass
+
         return status
+
+    @app.get("/api/openapi.json")
+    async def get_openapi_spec() -> Dict[str, Any]:
+        """
+        Generate OpenAPI 3.0 specification for this agent's REST API.
+        Provides live, interactive documentation via Swagger UI.
+        """
+        import os
+
+        # Get agent details
+        agent_name = os.environ.get('ASI_AGENT_NAME', 'Unknown Agent')
+        router_id = asi_app.router_id
+        container_name = os.environ.get('CONTAINER_NAME', 'unknown')
+
+        # Determine base URL
+        base_url = f"http://localhost:8888"
+
+        spec = {
+            "openapi": "3.0.0",
+            "info": {
+                "title": f"{agent_name} REST API",
+                "version": "1.0.0",
+                "description": f"""
+# {agent_name} - Autonomous Network Agent
+
+This agent is part of the **Won't You Be My Neighbor** autonomous networking system.
+
+**Router ID:** `{router_id}`
+**Container:** `{container_name}`
+
+## Features
+- Real-time protocol state (OSPF, BGP, IS-IS, BFD, GRE, EVPN)
+- Interface management and monitoring
+- Agentic conversation interface (Claude integration)
+- WebSocket streaming for logs and chat
+- MCP (Model Context Protocol) servers for LLM tool use
+- pyATS testing integration
+
+## Authentication
+Currently no authentication required for localhost access. For production deployments, implement token-based authentication.
+                """,
+                "contact": {
+                    "name": "WYBNMN Project",
+                    "url": "https://github.com/automateyournetwork/wontyoubemyneighbor"
+                }
+            },
+            "servers": [
+                {
+                    "url": base_url,
+                    "description": "Agent Web UI Server"
+                }
+            ],
+            "paths": {
+                "/api/status": {
+                    "get": {
+                        "summary": "Get agent status",
+                        "description": "Returns comprehensive agent status including router ID, running state, interfaces, protocols, and MCP servers",
+                        "tags": ["Core"],
+                        "responses": {
+                            "200": {
+                                "description": "Agent status",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "agent_name": {"type": "string"},
+                                                "router_id": {"type": "string"},
+                                                "running": {"type": "boolean"},
+                                                "interfaces": {"type": "array"},
+                                                "ospf": {"type": "object"},
+                                                "bgp": {"type": "object"},
+                                                "mcps": {"type": "array"}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "/api/interfaces": {
+                    "get": {
+                        "summary": "Get all interfaces",
+                        "description": "Returns detailed information about all configured network interfaces",
+                        "tags": ["Interfaces"],
+                        "responses": {
+                            "200": {
+                                "description": "Interface list",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "interfaces": {
+                                                    "type": "array",
+                                                    "items": {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "name": {"type": "string"},
+                                                            "type": {"type": "string"},
+                                                            "addresses": {"type": "array"},
+                                                            "status": {"type": "string"},
+                                                            "mtu": {"type": "integer"}
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "/api/ospf/neighbors": {
+                    "get": {
+                        "summary": "Get OSPF neighbors",
+                        "description": "Returns all OSPF neighbor adjacencies with state and statistics",
+                        "tags": ["OSPF"],
+                        "responses": {
+                            "200": {
+                                "description": "OSPF neighbor list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/ospf/routes": {
+                    "get": {
+                        "summary": "Get OSPF routes",
+                        "description": "Returns OSPF routing table calculated via SPF",
+                        "tags": ["OSPF"],
+                        "responses": {
+                            "200": {
+                                "description": "OSPF routing table",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/ospf/lsdb": {
+                    "get": {
+                        "summary": "Get OSPF LSDB",
+                        "description": "Returns Link State Database (all LSAs)",
+                        "tags": ["OSPF"],
+                        "responses": {
+                            "200": {
+                                "description": "OSPF LSDB",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/bgp/neighbors": {
+                    "get": {
+                        "summary": "Get BGP neighbors",
+                        "description": "Returns all BGP peer sessions with state and capabilities",
+                        "tags": ["BGP"],
+                        "responses": {
+                            "200": {
+                                "description": "BGP neighbor list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/bgp/routes": {
+                    "get": {
+                        "summary": "Get BGP routes",
+                        "description": "Returns BGP RIB (Routing Information Base)",
+                        "tags": ["BGP"],
+                        "responses": {
+                            "200": {
+                                "description": "BGP routing table",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/isis/neighbors": {
+                    "get": {
+                        "summary": "Get IS-IS adjacencies",
+                        "description": "Returns IS-IS neighbor adjacencies",
+                        "tags": ["IS-IS"],
+                        "responses": {
+                            "200": {
+                                "description": "IS-IS neighbor list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/bfd/sessions": {
+                    "get": {
+                        "summary": "Get BFD sessions",
+                        "description": "Returns Bidirectional Forwarding Detection session states",
+                        "tags": ["BFD"],
+                        "responses": {
+                            "200": {
+                                "description": "BFD session list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/gre/tunnels": {
+                    "get": {
+                        "summary": "Get GRE tunnels",
+                        "description": "Returns Generic Routing Encapsulation tunnel status",
+                        "tags": ["GRE"],
+                        "responses": {
+                            "200": {
+                                "description": "GRE tunnel list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/evpn/routes": {
+                    "get": {
+                        "summary": "Get EVPN routes",
+                        "description": "Returns EVPN (Ethernet VPN) route table",
+                        "tags": ["EVPN"],
+                        "responses": {
+                            "200": {
+                                "description": "EVPN route list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/lldp/neighbors": {
+                    "get": {
+                        "summary": "Get LLDP neighbors",
+                        "description": "Returns Layer 2 LLDP discovered neighbors",
+                        "tags": ["LLDP"],
+                        "responses": {
+                            "200": {
+                                "description": "LLDP neighbor list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/chat": {
+                    "post": {
+                        "summary": "Send chat message to agent",
+                        "description": "Send a message to the agentic conversation interface (Claude integration)",
+                        "tags": ["Agentic"],
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "message": {
+                                                "type": "string",
+                                                "description": "Message to send to the agent"
+                                            }
+                                        },
+                                        "required": ["message"]
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "Chat response",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/mcp/servers": {
+                    "get": {
+                        "summary": "Get MCP servers",
+                        "description": "Returns enabled Model Context Protocol servers with their tools and connection info",
+                        "tags": ["MCP"],
+                        "responses": {
+                            "200": {
+                                "description": "MCP server list with connection details"
+                            }
+                        }
+                    }
+                },
+                "/ws": {
+                    "get": {
+                        "summary": "WebSocket connection",
+                        "description": "Establish WebSocket for real-time logs and chat streaming",
+                        "tags": ["WebSocket"],
+                        "responses": {
+                            "101": {
+                                "description": "WebSocket connection established"
+                            }
+                        }
+                    }
+                }
+            },
+            "tags": [
+                {"name": "Core", "description": "Core agent status and information"},
+                {"name": "Interfaces", "description": "Network interface management"},
+                {"name": "OSPF", "description": "Open Shortest Path First protocol"},
+                {"name": "BGP", "description": "Border Gateway Protocol"},
+                {"name": "IS-IS", "description": "Intermediate System to Intermediate System"},
+                {"name": "BFD", "description": "Bidirectional Forwarding Detection"},
+                {"name": "GRE", "description": "Generic Routing Encapsulation tunnels"},
+                {"name": "EVPN", "description": "Ethernet VPN"},
+                {"name": "LLDP", "description": "Link Layer Discovery Protocol"},
+                {"name": "Agentic", "description": "AI-powered conversation interface"},
+                {"name": "MCP", "description": "Model Context Protocol servers"},
+                {"name": "WebSocket", "description": "Real-time bidirectional communication"}
+            ]
+        }
+
+        return spec
+
+    @app.get("/api/mcp/servers")
+    async def get_mcp_servers() -> Dict[str, Any]:
+        """
+        Get detailed information about enabled MCP (Model Context Protocol) servers.
+
+        Returns:
+        - Server names and descriptions
+        - Available tools/capabilities
+        - Connection endpoints
+        - Configuration examples for Claude Desktop, VSCode, and direct API access
+        """
+        import os
+
+        mcp_servers = []
+
+        # Get container name for connection instructions
+        container_name = os.environ.get('CONTAINER_NAME', 'unknown')
+        agent_name = os.environ.get('ASI_AGENT_NAME', 'Unknown Agent')
+
+        # Check for agentic bridge and MCP configurations
+        if agentic_bridge and hasattr(agentic_bridge, 'mcp_configs'):
+            for mcp_name, mcp_config in agentic_bridge.mcp_configs.items():
+                enabled = mcp_config.get('enabled', False)
+
+                server_info = {
+                    "name": mcp_name,
+                    "enabled": enabled,
+                    "type": mcp_config.get('type', 'unknown'),
+                    "description": "",
+                    "tools": [],
+                    "connection": {
+                        "protocol": "stdio",
+                        "container": container_name,
+                        "command": ""
+                    }
+                }
+
+                # Add descriptions and tool lists for known MCP types
+                if mcp_name == "routing":
+                    server_info["description"] = "Network routing table access and manipulation"
+                    server_info["tools"] = [
+                        {"name": "get_routes", "description": "Retrieve routing table entries"},
+                        {"name": "add_route", "description": "Add static route"},
+                        {"name": "delete_route", "description": "Remove route"},
+                        {"name": "get_route_info", "description": "Get detailed route information"}
+                    ]
+                    server_info["connection"]["command"] = f"docker exec -i {container_name} python3 -m mcp.servers.routing"
+
+                elif mcp_name == "protocols":
+                    server_info["description"] = "Protocol state access (OSPF, BGP, IS-IS, BFD)"
+                    server_info["tools"] = [
+                        {"name": "get_ospf_neighbors", "description": "Get OSPF neighbor list"},
+                        {"name": "get_ospf_lsdb", "description": "Get OSPF LSDB"},
+                        {"name": "get_bgp_neighbors", "description": "Get BGP peer list"},
+                        {"name": "get_bgp_rib", "description": "Get BGP routing table"},
+                        {"name": "get_isis_neighbors", "description": "Get IS-IS adjacencies"},
+                        {"name": "get_bfd_sessions", "description": "Get BFD session states"}
+                    ]
+                    server_info["connection"]["command"] = f"docker exec -i {container_name} python3 -m mcp.servers.protocols"
+
+                elif mcp_name == "interfaces":
+                    server_info["description"] = "Network interface configuration and monitoring"
+                    server_info["tools"] = [
+                        {"name": "get_interfaces", "description": "List all interfaces"},
+                        {"name": "get_interface_stats", "description": "Get interface statistics"},
+                        {"name": "set_interface_state", "description": "Bring interface up/down"},
+                        {"name": "get_interface_config", "description": "Get interface configuration"}
+                    ]
+                    server_info["connection"]["command"] = f"docker exec -i {container_name} python3 -m mcp.servers.interfaces"
+
+                elif mcp_name == "topology":
+                    server_info["description"] = "Network topology discovery and visualization"
+                    server_info["tools"] = [
+                        {"name": "get_topology", "description": "Get discovered network topology"},
+                        {"name": "get_neighbors", "description": "Get directly connected neighbors"},
+                        {"name": "get_paths", "description": "Get paths between nodes"},
+                        {"name": "export_topology", "description": "Export topology in various formats"}
+                    ]
+                    server_info["connection"]["command"] = f"docker exec -i {container_name} python3 -m mcp.servers.topology"
+
+                elif mcp_name == "testing":
+                    server_info["description"] = "pyATS network testing and validation"
+                    server_info["tools"] = [
+                        {"name": "run_test", "description": "Execute pyATS test"},
+                        {"name": "get_test_results", "description": "Retrieve test results"},
+                        {"name": "list_testcases", "description": "List available tests"},
+                        {"name": "validate_config", "description": "Validate device configuration"}
+                    ]
+                    server_info["connection"]["command"] = f"docker exec -i {container_name} python3 -m mcp.servers.testing"
+
+                mcp_servers.append(server_info)
+
+        # Connection examples for different clients
+        claude_desktop_config = {
+            "mcpServers": {
+                f"{agent_name.lower().replace(' ', '-')}-{server['name']}": {
+                    "command": "docker",
+                    "args": ["exec", "-i", container_name, "python3", "-m", f"mcp.servers.{server['name']}"]
+                }
+                for server in mcp_servers if server["enabled"]
+            }
+        }
+
+        vscode_config = {
+            "mcp.servers": [
+                {
+                    "name": f"{agent_name} - {server['name']}",
+                    "command": server["connection"]["command"],
+                    "type": "stdio"
+                }
+                for server in mcp_servers if server["enabled"]
+            ]
+        }
+
+        return {
+            "agent_name": agent_name,
+            "container_name": container_name,
+            "servers": mcp_servers,
+            "enabled_count": sum(1 for s in mcp_servers if s["enabled"]),
+            "total_count": len(mcp_servers),
+            "connection_examples": {
+                "claude_desktop": {
+                    "description": "Add to Claude Desktop's claude_desktop_config.json",
+                    "config": claude_desktop_config
+                },
+                "vscode": {
+                    "description": "Add to VSCode settings.json",
+                    "config": vscode_config
+                },
+                "direct_api": {
+                    "description": "Connect via WebSocket to /ws endpoint",
+                    "url": f"ws://localhost:8888/ws",
+                    "example": "Use WebSocket client to send MCP JSON-RPC messages"
+                }
+            }
+        }
 
     @app.get("/api/interfaces")
     async def get_interfaces() -> Dict[str, Any]:
