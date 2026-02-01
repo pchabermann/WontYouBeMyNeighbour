@@ -2077,7 +2077,9 @@ Currently no authentication required for localhost access. For production deploy
 
         try:
             from pyATS_Tests import run_all_tests, get_tests_for_agent
-        except ImportError:
+            from pyATS_Tests.results_storage import get_storage
+        except ImportError as e:
+            logger.error(f"Failed to import pyATS modules: {e}")
             return {
                 "status": "error",
                 "message": "pyATS_Tests module not available",
@@ -2163,13 +2165,26 @@ Currently no authentication required for localhost access. For production deploy
                         "timestamp": result.get("timestamp", datetime.now().isoformat())
                     })
 
-            # Store results for persistence
+            # Store results for persistence (both in-memory and database)
             _recent_test_results = {
                 "results": flattened_results,
                 "timestamp": datetime.now().isoformat(),
                 "summary": test_results.get("summary", {}),
                 "agent_id": agent_id or asi_app.router_id
             }
+
+            # Store in persistent database
+            try:
+                storage = get_storage()
+                storage.store_test_run(
+                    agent_id=agent_id or asi_app.router_id,
+                    results=flattened_results,
+                    summary=test_results.get("summary", {})
+                )
+                logger.info(f"Stored test results in persistent database for agent {agent_id or asi_app.router_id}")
+            except Exception as storage_err:
+                logger.warning(f"Failed to store test results in database: {storage_err}")
+                # Continue anyway - in-memory storage still works
 
             # Return with flattened results for the UI
             return {
@@ -2180,7 +2195,7 @@ Currently no authentication required for localhost access. For production deploy
                 "results": flattened_results
             }
         except Exception as e:
-            logging.getLogger("WebUI").error(f"Test execution failed: {e}")
+            logger.error(f"Test execution failed: {e}", exc_info=True)
             return {
                 "status": "error",
                 "message": str(e),
@@ -2189,6 +2204,20 @@ Currently no authentication required for localhost access. For production deploy
 
     def get_recent_test_results() -> Dict[str, Any]:
         """Get the most recent test results (for page refresh persistence)"""
+        # Try persistent storage first
+        try:
+            from pyATS_Tests.results_storage import get_storage
+            storage = get_storage()
+            agent_id = getattr(asi_app, 'router_id', 'local')
+            stored_results = storage.get_latest_results(agent_id, limit=50)
+
+            if stored_results and stored_results.get("results"):
+                logger.debug(f"Retrieved {len(stored_results['results'])} test results from persistent storage")
+                return stored_results
+        except Exception as e:
+            logger.debug(f"Could not retrieve from persistent storage: {e}")
+
+        # Fall back to in-memory storage
         return _recent_test_results
 
     async def update_test_schedule(
