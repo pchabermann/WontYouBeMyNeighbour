@@ -154,9 +154,12 @@ class HelloHandler:
             hello = packet[OSPFHello]
 
             # Validate Hello parameters (RFC 2328 Section 10.5)
-            if hello.network_mask != self.network_mask:
-                logger.warning(f"Hello from {source_ip} with mismatched network mask")
-                return None
+            # Per RFC 2328 Section 9.1, network mask is ignored on point-to-point networks
+            logger.debug(f"[{self.interface}] Checking network mask: self.network_type={self.network_type}, constant={NETWORK_TYPE_POINT_TO_POINT}, equal={self.network_type == NETWORK_TYPE_POINT_TO_POINT}")
+            if self.network_type != NETWORK_TYPE_POINT_TO_POINT:
+                if hello.network_mask != self.network_mask:
+                    logger.warning(f"Hello from {source_ip} with mismatched network mask")
+                    return None
 
             if hello.hello_interval != self.hello_interval:
                 logger.warning(f"Hello from {source_ip} with mismatched hello interval")

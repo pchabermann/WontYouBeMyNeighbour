@@ -88,6 +88,7 @@ class TOONInterface:
     m: Optional[str] = None  # mac
     s: str = "up"  # state
     mtu: int = 1500
+    description: str = ""  # interface description
     tun: Optional[Dict[str, Any]] = None  # tunnel config
 
     def to_dict(self) -> Dict[str, Any]:

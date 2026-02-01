@@ -600,6 +600,161 @@ class DockerManager:
             health=health
         )
 
+    def exec_command(self, container_name: str, command: List[str]) -> Tuple[bool, str]:
+        """
+        Execute a command inside a container
+
+        Args:
+            container_name: Container name
+            command: Command to execute as list of strings
+
+        Returns:
+            Tuple of (success: bool, output: str)
+        """
+        if not self.available:
+            return False, "Docker not available"
+
+        try:
+            container = self.client.containers.get(container_name)
+            exit_code, output = container.exec_run(command)
+            output_str = output.decode('utf-8') if isinstance(output, bytes) else str(output)
+            success = exit_code == 0
+            if not success:
+                self.logger.warning(f"Command failed in {container_name}: {' '.join(command)} (exit code: {exit_code})")
+            return success, output_str
+        except NotFound:
+            return False, f"Container {container_name} not found"
+        except Exception as e:
+            self.logger.error(f"Error executing command in {container_name}: {e}")
+            return False, str(e)
+
+    def connect_to_external_network(
+        self,
+        container_name: str,
+        network_name: str,
+        ipv4_address: Optional[str] = None
+    ) -> bool:
+        """
+        Connect a container to an external Docker network
+
+        Args:
+            container_name: Container to connect
+            network_name: External network name
+            ipv4_address: Optional specific IP address to assign
+
+        Returns:
+            True if connected successfully
+        """
+        if not self.available:
+            return False
+
+        try:
+            container = self.client.containers.get(container_name)
+            network = self.client.networks.get(network_name)
+
+            # Build connection config
+            connect_config = {}
+            if ipv4_address:
+                connect_config['ipv4_address'] = ipv4_address
+
+            network.connect(container, **connect_config)
+            self.logger.info(f"Connected {container_name} to external network {network_name}" +
+                           (f" with IP {ipv4_address}" if ipv4_address else ""))
+            return True
+        except NotFound as e:
+            self.logger.error(f"Network or container not found: {e}")
+            return False
+        except Exception as e:
+            self.logger.error(f"Error connecting to external network: {e}")
+            return False
+
+    def create_gre_tunnel(
+        self,
+        container_name: str,
+        tunnel_name: str,
+        local_ip: str,
+        remote_ip: str,
+        tunnel_ip: str,
+        key: Optional[int] = None,
+        ttl: int = 255,
+        mtu: int = 1400
+    ) -> bool:
+        """
+        Create a GRE tunnel inside a container
+
+        Args:
+            container_name: Container name
+            tunnel_name: Tunnel interface name (e.g., "gre0")
+            local_ip: Local endpoint IP (underlay)
+            remote_ip: Remote endpoint IP (underlay)
+            tunnel_ip: Tunnel interface IP with CIDR (e.g., "10.255.0.1/30")
+            key: Optional GRE key for security
+            ttl: TTL value
+            mtu: MTU for tunnel interface
+
+        Returns:
+            True if tunnel created successfully
+        """
+        if not self.available:
+            return False
+
+        try:
+            # Build the ip tunnel add command
+            tunnel_cmd = [
+                "ip", "tunnel", "add", tunnel_name, "mode", "gre",
+                "local", local_ip,
+                "remote", remote_ip,
+                "ttl", str(ttl)
+            ]
+
+            if key is not None:
+                tunnel_cmd.extend(["key", str(key)])
+
+            # Add pmtudisc for proper MTU handling
+            tunnel_cmd.append("pmtudisc")
+
+            # Create tunnel
+            success, output = self.exec_command(container_name, tunnel_cmd)
+            if not success:
+                self.logger.error(f"Failed to create GRE tunnel {tunnel_name}: {output}")
+                return False
+
+            # Assign IP address
+            success, output = self.exec_command(
+                container_name,
+                ["ip", "addr", "add", tunnel_ip, "dev", tunnel_name]
+            )
+            if not success:
+                self.logger.error(f"Failed to assign IP {tunnel_ip} to {tunnel_name}: {output}")
+                return False
+
+            # Set MTU
+            success, output = self.exec_command(
+                container_name,
+                ["ip", "link", "set", tunnel_name, "mtu", str(mtu)]
+            )
+            if not success:
+                self.logger.warning(f"Failed to set MTU on {tunnel_name}: {output}")
+
+            # Bring interface up
+            success, output = self.exec_command(
+                container_name,
+                ["ip", "link", "set", tunnel_name, "up"]
+            )
+            if not success:
+                self.logger.error(f"Failed to bring up {tunnel_name}: {output}")
+                return False
+
+            self.logger.info(
+                f"Created GRE tunnel {tunnel_name} in {container_name}: "
+                f"{local_ip} -> {remote_ip}, tunnel IP {tunnel_ip}, key {key}, MTU {mtu}"
+            )
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error creating GRE tunnel in {container_name}: {e}")
+            return False
+
     # Image Operations
 
     def pull_image(self, image: str) -> bool:

@@ -673,6 +673,201 @@ class DynamicTestGenerator:
             agent_id=self.agent_id,
         )
 
+    def generate_gre_tunnel_test(
+        self,
+        tunnels: Optional[List[Dict[str, Any]]] = None,
+        trigger: TestTrigger = TestTrigger.SELF_ASSESSMENT,
+    ) -> GeneratedTest:
+        """
+        Generate test to verify GRE tunnel states and connectivity
+
+        Args:
+            tunnels: List of GRE tunnels to test with their expected parameters
+                Each tunnel dict should have:
+                - name: Tunnel interface name (e.g., "gre0")
+                - local_ip: Expected local endpoint IP
+                - remote_ip: Expected remote endpoint IP
+                - tunnel_ip: Expected tunnel IP address
+                - key: Expected GRE key (optional)
+                - remote_host: Remote endpoint to ping through tunnel (optional)
+        """
+        test_id = self._next_test_id()
+
+        # Auto-detect GRE tunnels from agent interfaces if not provided
+        if tunnels is None:
+            tunnels = []
+            for intf in self.interfaces:
+                if intf.get("t") == "gre" or intf.get("n", "").startswith("gre"):
+                    tunnel_info = {
+                        "name": intf.get("n", "gre0"),
+                        "tunnel_ip": intf.get("ip", ""),
+                        "expected_state": "up",
+                    }
+                    # Try to extract GRE metadata from interface config
+                    if "gre_local" in intf:
+                        tunnel_info["local_ip"] = intf["gre_local"]
+                    if "gre_remote" in intf:
+                        tunnel_info["remote_ip"] = intf["gre_remote"]
+                    if "gre_key" in intf:
+                        tunnel_info["key"] = intf["gre_key"]
+                    tunnels.append(tunnel_info)
+
+        if not tunnels:
+            # No GRE tunnels to test
+            logger.warning(f"No GRE tunnels found for {self.agent_id}")
+
+        test_data = {
+            "devices": [self.agent_id],
+            "tunnels": tunnels,
+        }
+
+        test_class = textwrap.dedent('''
+            class GRETunnelTest(aetest.Testcase):
+                """Verify GRE tunnel states and connectivity"""
+
+                @aetest.test
+                def check_gre_tunnel_state(self):
+                    """Verify GRE tunnels are up"""
+                    device = self.parent.parameters.get(TEST_DATA["devices"][0])
+                    tunnels = TEST_DATA.get("tunnels", [])
+
+                    if not tunnels:
+                        self.skipped("No GRE tunnels configured to test")
+                        return
+
+                    failed_tunnels = []
+
+                    for tunnel in tunnels:
+                        tunnel_name = tunnel.get("name", "")
+                        expected_state = tunnel.get("expected_state", "up").lower()
+
+                        try:
+                            # Try to get interface status
+                            output = device.execute(f"ip -o link show {tunnel_name}")
+
+                            if "state UP" in output and expected_state == "up":
+                                logger.info(f"Tunnel {tunnel_name} is UP")
+                            elif "state DOWN" in output and expected_state == "down":
+                                logger.info(f"Tunnel {tunnel_name} is DOWN (expected)")
+                            else:
+                                state = "UP" if "state UP" in output else "DOWN"
+                                failed_tunnels.append(
+                                    f"{tunnel_name}: expected {expected_state}, got {state}"
+                                )
+
+                        except Exception as e:
+                            failed_tunnels.append(f"{tunnel_name}: Error checking state - {e}")
+
+                    if failed_tunnels:
+                        self.failed(f"GRE tunnel state issues: {failed_tunnels}")
+                    else:
+                        self.passed(f"All {len(tunnels)} GRE tunnels in expected state")
+
+                @aetest.test
+                def check_gre_tunnel_config(self):
+                    """Verify GRE tunnel configuration parameters"""
+                    device = self.parent.parameters.get(TEST_DATA["devices"][0])
+                    tunnels = TEST_DATA.get("tunnels", [])
+
+                    config_issues = []
+
+                    for tunnel in tunnels:
+                        tunnel_name = tunnel.get("name", "")
+                        expected_local = tunnel.get("local_ip")
+                        expected_remote = tunnel.get("remote_ip")
+                        expected_key = tunnel.get("key")
+
+                        try:
+                            # Get tunnel configuration
+                            output = device.execute(f"ip tunnel show {tunnel_name}")
+
+                            # Check local endpoint
+                            if expected_local and expected_local not in output:
+                                config_issues.append(
+                                    f"{tunnel_name}: local endpoint mismatch (expected {expected_local})"
+                                )
+
+                            # Check remote endpoint
+                            if expected_remote and expected_remote not in output:
+                                config_issues.append(
+                                    f"{tunnel_name}: remote endpoint mismatch (expected {expected_remote})"
+                                )
+
+                            # Check GRE key
+                            if expected_key is not None:
+                                if f"key {expected_key}" not in output:
+                                    config_issues.append(
+                                        f"{tunnel_name}: GRE key mismatch (expected {expected_key})"
+                                    )
+
+                        except Exception as e:
+                            config_issues.append(f"{tunnel_name}: Error checking config - {e}")
+
+                    if config_issues:
+                        self.failed(f"GRE configuration issues: {config_issues}")
+                    else:
+                        self.passed(f"All GRE tunnel configurations correct")
+
+                @aetest.test
+                def test_gre_connectivity(self):
+                    """Test connectivity through GRE tunnels"""
+                    device = self.parent.parameters.get(TEST_DATA["devices"][0])
+                    tunnels = TEST_DATA.get("tunnels", [])
+
+                    connectivity_failures = []
+
+                    for tunnel in tunnels:
+                        tunnel_name = tunnel.get("name", "")
+                        remote_host = tunnel.get("remote_host")
+
+                        # Try to ping remote host through tunnel if specified
+                        if remote_host:
+                            try:
+                                result = device.execute(f"ping -c 3 -W 2 {remote_host}")
+                                if "0 received" in result or "100% packet loss" in result:
+                                    connectivity_failures.append(
+                                        f"{tunnel_name}: Cannot reach {remote_host}"
+                                    )
+                                else:
+                                    logger.info(f"Connectivity OK through {tunnel_name} to {remote_host}")
+                            except Exception as e:
+                                connectivity_failures.append(
+                                    f"{tunnel_name}: Ping test failed - {e}"
+                                )
+
+                    if connectivity_failures:
+                        self.failed(f"GRE connectivity issues: {connectivity_failures}")
+                    else:
+                        self.passed("GRE tunnel connectivity verified")
+        ''')
+
+        script = self.AETEST_TEMPLATE.format(
+            description=f"GRE Tunnel verification for {len(tunnels)} tunnel(s)",
+            agent_id=self.agent_id,
+            generated_at=datetime.now().isoformat(),
+            trigger=trigger.value,
+            category=TestCategory.INTERFACE.value,
+            test_data=json.dumps(test_data, indent=4),
+            test_classes=test_class,
+        )
+
+        return GeneratedTest(
+            test_id=test_id,
+            test_name="GRE Tunnel Test",
+            category=TestCategory.INTERFACE,
+            trigger=trigger,
+            description=f"Verify GRE tunnel states and connectivity on {self.agent_id}",
+            script=script,
+            test_data=test_data,
+            expected_outcomes=[
+                "All GRE tunnels should be in expected state",
+                "GRE tunnel configuration should match expected parameters",
+                "Connectivity through GRE tunnels should work",
+            ],
+            agent_id=self.agent_id,
+            context={"tunnel_count": len(tunnels)},
+        )
+
     # =========================================================================
     # Routing Tests
     # =========================================================================

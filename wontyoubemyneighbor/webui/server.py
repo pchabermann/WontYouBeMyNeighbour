@@ -1834,8 +1834,34 @@ Currently no authentication required for localhost access. For production deploy
         """
         # Support both 'count' and 'tail' parameters
         num_entries = tail if tail is not None else count
-        logs = log_buffer.get_recent(num_entries)
-        return {"logs": logs, "count": len(logs)}
+
+        try:
+            logs = log_buffer.get_recent(num_entries)
+
+            # If buffer is empty, add a diagnostic log
+            if len(logs) == 0:
+                logger.debug("Log buffer is empty - no logs captured yet")
+                # Return a helpful message
+                return {
+                    "logs": [{
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "INFO",
+                        "message": "No logs captured yet. Logs will appear here when protocols generate events."
+                    }],
+                    "count": 1
+                }
+
+            return {"logs": logs, "count": len(logs)}
+        except Exception as e:
+            logger.error(f"Error fetching logs: {e}")
+            return {
+                "logs": [{
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "level": "ERROR",
+                    "message": f"Error fetching logs: {str(e)}"
+                }],
+                "count": 1
+            }
 
     @app.websocket("/ws/monitor")
     async def websocket_monitor(websocket: WebSocket):

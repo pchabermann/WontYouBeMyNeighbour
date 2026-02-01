@@ -747,6 +747,65 @@
             cursor: not-allowed;
         }
 
+        /* Start Conversation Button */
+        .start-conversation-btn {
+            padding: 8px 16px;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            box-shadow: 0 2px 8px rgba(0, 184, 217, 0.3);
+        }
+
+        .start-conversation-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 184, 217, 0.5);
+        }
+
+        .start-conversation-btn:active {
+            transform: translateY(0);
+        }
+
+        .start-conversation-btn::before {
+            content: "💬";
+            font-size: 1rem;
+        }
+
+        .resume-conversation-btn {
+            background: linear-gradient(135deg, var(--accent-green), var(--accent-cyan));
+        }
+
+        .resume-conversation-btn::before {
+            content: "🔄";
+        }
+
+        /* Programmability Tab Styles */
+        .programmability-subtab.active {
+            border-bottom: 2px solid var(--accent-cyan) !important;
+            color: var(--accent-cyan) !important;
+            font-weight: 600;
+        }
+
+        .programmability-subtab:hover {
+            color: var(--accent-cyan);
+        }
+
+        /* Swagger UI Custom Styling */
+        #swagger-ui {
+            max-width: 100%;
+        }
+
+        #swagger-ui .swagger-ui {
+            font-family: inherit;
+        }
+
         /* Testing Tab Styles */
         .metric-card.testing::before { background: #22d3ee; }
         .metric-card.gait::before { background: #f59e0b; }
@@ -1391,6 +1450,7 @@
             <div class="section">
                 <div class="section-header">
                     <h3>Interface Configuration</h3>
+                    <button class="start-conversation-btn" onclick="dashboard.startConversation('interfaces')">Explain Interfaces</button>
                 </div>
                 <table class="data-table">
                     <thead>
@@ -1435,6 +1495,7 @@
                 <div class="section">
                     <div class="section-header">
                         <h3>OSPF Neighbors</h3>
+                        <button class="start-conversation-btn" onclick="dashboard.startConversation('ospf-neighbors')">Explain Neighbors</button>
                     </div>
                     <table class="data-table">
                         <thead>
@@ -1454,6 +1515,7 @@
                 <div class="section">
                     <div class="section-header">
                         <h3>OSPF Routes</h3>
+                        <button class="start-conversation-btn" onclick="dashboard.startConversation('ospf-routes')">Explain Routes</button>
                     </div>
                     <table class="data-table">
                         <thead>
@@ -1498,6 +1560,7 @@
                 <div class="section">
                     <div class="section-header">
                         <h3>OSPFv3 Neighbors</h3>
+                        <button class="start-conversation-btn" onclick="dashboard.startConversation('ospfv3-neighbors')">Explain IPv6 Neighbors</button>
                     </div>
                     <table class="data-table">
                         <thead>
@@ -1571,6 +1634,7 @@
                     <div class="section">
                         <div class="section-header">
                             <h3>BGP IPv4 Peers</h3>
+                            <button class="start-conversation-btn" onclick="dashboard.startConversation('bgp-peers')">Explain Peers</button>
                         </div>
                         <table class="data-table">
                             <thead>
@@ -1591,6 +1655,7 @@
                     <div class="section">
                         <div class="section-header">
                             <h3>BGP IPv4 Routes (Loc-RIB)</h3>
+                            <button class="start-conversation-btn" onclick="dashboard.startConversation('bgp-routes')">Explain Routes</button>
                         </div>
                         <table class="data-table">
                             <thead>
@@ -1616,6 +1681,7 @@
                     <div class="section">
                         <div class="section-header">
                             <h3>BGP IPv6 Peers</h3>
+                            <button class="start-conversation-btn" onclick="dashboard.startConversation('bgp-ipv6-peers')">Explain IPv6 Peers</button>
                         </div>
                         <table class="data-table">
                             <thead>
@@ -1636,6 +1702,7 @@
                     <div class="section">
                         <div class="section-header">
                             <h3>BGP IPv6 Routes (Loc-RIB)</h3>
+                            <button class="start-conversation-btn" onclick="dashboard.startConversation('bgp-ipv6-routes')">Explain IPv6 Routes</button>
                         </div>
                         <table class="data-table">
                             <thead>
@@ -1684,6 +1751,7 @@
                 <div class="section">
                     <div class="section-header">
                         <h3>EVPN Routes</h3>
+                        <button class="start-conversation-btn" onclick="dashboard.startConversation('evpn-routes')">Explain EVPN</button>
                     </div>
                     <table class="data-table">
                         <thead>
@@ -1728,6 +1796,7 @@
             <div class="section">
                 <div class="section-header">
                     <h3>IS-IS Adjacencies</h3>
+                    <button class="start-conversation-btn" onclick="dashboard.startConversation('isis-adjacencies')">Explain IS-IS</button>
                 </div>
                 <table class="data-table">
                     <thead>
@@ -1999,6 +2068,7 @@
             <div class="section">
                 <div class="section-header">
                     <h3>GRE Tunnel Details</h3>
+                    <button class="start-conversation-btn" onclick="dashboard.startConversation('gre-tunnels')">Test & Explain Tunnels</button>
                 </div>
                 <table class="data-table">
                     <thead>
@@ -2055,6 +2125,7 @@
             <div class="section">
                 <div class="section-header">
                     <h3>BFD Session Details</h3>
+                    <button class="start-conversation-btn" onclick="dashboard.startConversation('bfd-sessions')">Explain BFD</button>
                 </div>
                 <table class="data-table">
                     <thead>
@@ -2214,11 +2285,14 @@
                 <div class="section">
                     <div class="section-header">
                         <h3>Test Results</h3>
-                        <select id="results-filter">
-                            <option value="all">All Results</option>
-                            <option value="failed">Failed Only</option>
-                            <option value="passed">Passed Only</option>
-                        </select>
+                        <div style="display: flex; gap: 10px; align-items: center;">
+                            <select id="results-filter">
+                                <option value="all">All Results</option>
+                                <option value="failed">Failed Only</option>
+                                <option value="passed">Passed Only</option>
+                            </select>
+                            <button class="start-conversation-btn" onclick="dashboard.startConversation('pyats-results')" style="display: none;" id="pyats-discuss-btn">Discuss Results</button>
+                        </div>
                     </div>
                     <table class="data-table">
                         <thead>
@@ -2295,6 +2369,7 @@
                 <div class="section-header">
                     <h3>Agent State Mind Map</h3>
                     <div class="markmap-controls" style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
+                        <button class="start-conversation-btn" onclick="dashboard.startConversation('markmap')">Explain Topology</button>
                         <label style="display: flex; align-items: center; gap: 5px;">
                             <input type="checkbox" id="markmap-auto-refresh" checked>
                             Auto-refresh
@@ -2516,6 +2591,7 @@
                 <div class="section-header">
                     <h3>Prometheus Metrics Export</h3>
                     <div style="display: flex; gap: 10px;">
+                        <button class="start-conversation-btn" onclick="dashboard.startConversation('prometheus')">Explain Metrics</button>
                         <button class="btn btn-secondary" id="prometheus-export-btn">Export Prometheus Format</button>
                         <button class="btn btn-secondary" id="prometheus-scrape-btn">View Scrape Endpoint</button>
                     </div>
@@ -2714,6 +2790,7 @@
                 <div class="section-header">
                     <h3>LLDP Neighbors</h3>
                     <div style="display: flex; gap: 10px; align-items: center;">
+                        <button class="start-conversation-btn" onclick="dashboard.startConversation('lldp-neighbors')">Explain Neighbors</button>
                         <button class="btn btn-secondary" id="lldp-refresh-btn">Refresh</button>
                     </div>
                 </div>
@@ -11926,7 +12003,10 @@ agent-router-1> exit
             <div class="section" style="margin-bottom: 20px;">
                 <div class="section-header">
                     <h3>📊 RFC 4594 DiffServ QoS - End-to-End</h3>
-                    <span style="font-size: 0.75rem; color: #1a1a2e; background: #22c55e; padding: 4px 8px; border-radius: 4px; font-weight: 600;">ALWAYS ON</span>
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <button class="start-conversation-btn" onclick="dashboard.startConversation('qos')">Explain QoS</button>
+                        <span style="font-size: 0.75rem; color: #1a1a2e; background: #22c55e; padding: 4px 8px; border-radius: 4px; font-weight: 600;">ALWAYS ON</span>
+                    </div>
                 </div>
                 <div style="padding: 15px; background: var(--bg-tertiary); border-radius: 8px;">
                     <p style="color: var(--text-secondary); margin: 0; font-size: 0.9rem;">
@@ -12075,7 +12155,10 @@ agent-router-1> exit
             <div class="section" style="margin-bottom: 20px;">
                 <div class="section-header">
                     <h3>🌊 RFC 7011 IPFIX/NetFlow</h3>
-                    <span style="font-size: 0.75rem; color: #1a1a2e; background: #06b6d4; padding: 4px 8px; border-radius: 4px; font-weight: 600;">TRACKING</span>
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <button class="start-conversation-btn" onclick="dashboard.startConversation('netflow')">Analyze Flows</button>
+                        <span style="font-size: 0.75rem; color: #1a1a2e; background: #06b6d4; padding: 4px 8px; border-radius: 4px; font-weight: 600;">TRACKING</span>
+                    </div>
                 </div>
                 <div style="padding: 15px; background: var(--bg-tertiary); border-radius: 8px;">
                     <p style="color: var(--text-secondary); margin: 0 0 10px 0; font-size: 0.9rem;">
@@ -12192,6 +12275,139 @@ agent-router-1> exit
                         <span class="log-timestamp">[--]</span>
                         <span class="log-level INFO">INFO</span>
                         <span>Waiting for logs...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Programmability Content (OpenAPI + MCP) -->
+        <div class="protocol-content" id="programmability-content">
+            <div class="section">
+                <div class="section-header">
+                    <h3>🔌 Agent Programmability</h3>
+                    <button class="start-conversation-btn" onclick="dashboard.startConversation('programmability')">Help Me Integrate</button>
+                </div>
+                <p style="color: var(--text-secondary); margin-bottom: 20px;">
+                    Integrate this agent into your automation workflows using REST APIs (OpenAPI/Swagger) or connect via MCP (Model Context Protocol) servers.
+                </p>
+
+                <!-- Sub-tabs for OpenAPI and MCP -->
+                <div style="display: flex; gap: 10px; margin-bottom: 20px; border-bottom: 2px solid var(--border-color);">
+                    <button class="programmability-subtab active" data-subtab="openapi" onclick="dashboard.switchProgrammabilityTab('openapi')" style="padding: 10px 20px; background: none; border: none; color: var(--text-secondary); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s;">
+                        📜 OpenAPI/Swagger
+                    </button>
+                    <button class="programmability-subtab" data-subtab="mcp" onclick="dashboard.switchProgrammabilityTab('mcp')" style="padding: 10px 20px; background: none; border: none; color: var(--text-secondary); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.2s;">
+                        🔗 MCP Servers
+                    </button>
+                </div>
+
+                <!-- OpenAPI/Swagger Sub-tab -->
+                <div id="openapi-subtab-content" class="programmability-subtab-content">
+                    <div style="background: var(--bg-tertiary); padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                            <h4 style="margin: 0; color: var(--accent-cyan);">REST API Documentation</h4>
+                            <div style="display: flex; gap: 10px;">
+                                <button class="btn btn-secondary" onclick="dashboard.downloadOpenAPISpec()">
+                                    💾 Download Spec
+                                </button>
+                                <button class="btn btn-secondary" onclick="dashboard.copyOpenAPIURL()">
+                                    📋 Copy URL
+                                </button>
+                            </div>
+                        </div>
+                        <p style="color: var(--text-secondary); font-size: 0.9rem; margin: 0;">
+                            Access the agent's REST API for automation, monitoring, and integration. All endpoints are documented below with examples.
+                        </p>
+                    </div>
+
+                    <!-- API Base URL -->
+                    <div style="background: var(--bg-secondary); padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 3px solid var(--accent-green);">
+                        <strong style="color: var(--accent-green);">API Base URL:</strong>
+                        <code id="api-base-url" style="color: var(--accent-cyan); margin-left: 10px; font-family: monospace;">http://localhost:8888</code>
+                    </div>
+
+                    <!-- Swagger UI Container -->
+                    <div style="background: #fff; border-radius: 8px; padding: 0; overflow: hidden;">
+                        <div id="swagger-ui"></div>
+                    </div>
+
+                    <!-- Manual API Examples -->
+                    <div style="margin-top: 20px;">
+                        <h4 style="color: var(--text-primary); margin-bottom: 10px;">Quick Start Examples</h4>
+                        <div style="background: var(--bg-tertiary); padding: 15px; border-radius: 8px;">
+                            <p style="color: var(--text-secondary); margin-bottom: 10px;"><strong>Get Agent Status:</strong></p>
+                            <pre style="background: #1a1a2e; color: #00d9ff; padding: 12px; border-radius: 6px; overflow-x: auto; margin: 0;"><code>curl http://localhost:8888/api/status</code></pre>
+
+                            <p style="color: var(--text-secondary); margin: 15px 0 10px;"><strong>Get OSPF Neighbors:</strong></p>
+                            <pre style="background: #1a1a2e; color: #00d9ff; padding: 12px; border-radius: 6px; overflow-x: auto; margin: 0;"><code>curl http://localhost:8888/api/ospf/neighbors</code></pre>
+
+                            <p style="color: var(--text-secondary); margin: 15px 0 10px;"><strong>Python Example:</strong></p>
+                            <pre style="background: #1a1a2e; color: #00d9ff; padding: 12px; border-radius: 6px; overflow-x: auto; margin: 0; font-size: 0.85rem;"><code>import requests
+
+# Get agent status
+response = requests.get('http://localhost:8888/api/status')
+status = response.json()
+print(f"Router ID: {status['router_id']}")
+print(f"Protocols: {', '.join(status['protocols'])}")</code></pre>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- MCP Servers Sub-tab -->
+                <div id="mcp-subtab-content" class="programmability-subtab-content" style="display: none;">
+                    <div style="background: var(--bg-tertiary); padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+                        <h4 style="margin: 0 0 10px 0; color: var(--accent-purple);">Model Context Protocol (MCP) Servers</h4>
+                        <p style="color: var(--text-secondary); font-size: 0.9rem; margin: 0;">
+                            Connect Claude Desktop, VSCode, or other MCP clients to this agent's capabilities. Each server provides specialized tools and context.
+                        </p>
+                    </div>
+
+                    <!-- Enabled MCP Servers List -->
+                    <div id="mcp-servers-list">
+                        <div style="color: var(--text-secondary); padding: 20px; text-align: center;">
+                            Loading MCP servers...
+                        </div>
+                    </div>
+
+                    <!-- How to Connect -->
+                    <div style="margin-top: 20px;">
+                        <h4 style="color: var(--text-primary); margin-bottom: 10px;">How to Connect MCP Clients</h4>
+
+                        <!-- Claude Desktop -->
+                        <div style="background: var(--bg-tertiary); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                            <h5 style="color: var(--accent-cyan); margin: 0 0 10px 0;">Claude Desktop</h5>
+                            <p style="color: var(--text-secondary); font-size: 0.9rem;">Add to <code>claude_desktop_config.json</code>:</p>
+                            <pre id="claude-desktop-config" style="background: #1a1a2e; color: #00d9ff; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 0.85rem;"><code>{
+  "mcpServers": {
+    "agent-network": {
+      "command": "docker",
+      "args": ["exec", "-i", "CONTAINER_NAME", "python3", "-m", "agentic.mcp.server"]
+    }
+  }
+}</code></pre>
+                            <button class="btn btn-secondary" onclick="dashboard.copyMCPConfig('claude-desktop')" style="margin-top: 10px;">
+                                📋 Copy Config
+                            </button>
+                        </div>
+
+                        <!-- VSCode/Continue -->
+                        <div style="background: var(--bg-tertiary); padding: 15px; border-radius: 8px; margin-bottom: 15px;">
+                            <h5 style="color: var(--accent-green); margin: 0 0 10px 0;">VSCode / Continue</h5>
+                            <p style="color: var(--text-secondary); font-size: 0.9rem;">Add to MCP settings:</p>
+                            <pre style="background: #1a1a2e; color: #00d9ff; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 0.85rem;"><code>mcp server add http://localhost:8888/mcp</code></pre>
+                        </div>
+
+                        <!-- Direct Connection -->
+                        <div style="background: var(--bg-tertiary); padding: 15px; border-radius: 8px;">
+                            <h5 style="color: var(--accent-yellow); margin: 0 0 10px 0;">Direct API Connection</h5>
+                            <p style="color: var(--text-secondary); font-size: 0.9rem;">Connect programmatically:</p>
+                            <pre style="background: #1a1a2e; color: #00d9ff; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 0.85rem;"><code>from mcp import Client
+
+client = Client("http://localhost:8888/mcp")
+tools = await client.list_tools()
+for tool in tools:
+    print(f"- {tool.name}: {tool.description}")</code></pre>
+                        </div>
                     </div>
                 </div>
             </div>

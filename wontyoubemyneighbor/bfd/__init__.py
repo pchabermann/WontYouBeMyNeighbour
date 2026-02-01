@@ -35,7 +35,13 @@ from .session import (
     BFDSession,
     BFDSessionStats,
 )
-from .manager import BFDManager, get_bfd_manager, configure_bfd_manager
+from .manager import (
+    BFDManager,
+    BFDManagerConfig,
+    BFDManagerStats,
+    get_bfd_manager,
+    configure_bfd_manager,
+)
 from .packet import BFDPacket, encode_bfd_packet, decode_bfd_packet
 from .constants import (
     BFD_UDP_PORT,
@@ -56,6 +62,8 @@ __all__ = [
     "BFDSessionStats",
     # Manager
     "BFDManager",
+    "BFDManagerConfig",
+    "BFDManagerStats",
     "get_bfd_manager",
     "configure_bfd_manager",
     # Packet

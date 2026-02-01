@@ -214,6 +214,15 @@ async def import_network_template(session_id: str, network_data: Dict[str, Any])
             for proto in agent_data.get("protos", []):
                 protocols.append(proto)
 
+            # DEBUG GRE: Check if interfaces have tun config
+            interfaces = agent_data.get("ifs", [])
+            print(f"\n=== IMPORT JSON DEBUG: Agent {agent_data['id']} has {len(interfaces)} interfaces ===", flush=True)
+            for i, iface in enumerate(interfaces):
+                print(f"  Interface {i}: {iface.get('n')} (type={iface.get('t')})", flush=True)
+                if iface.get("t") == "gre":
+                    print(f"  >>> GRE INTERFACE FOUND! tun field present: {'tun' in iface}, value: {iface.get('tun')}", flush=True)
+                    logger.info(f"IMPORT DEBUG: Agent {agent_data['id']} interface {i} ({iface.get('n')}): tun={iface.get('tun')}")
+
             # Build agent config
             agent_config = AgentConfig(
                 id=agent_data["id"],
@@ -221,9 +230,17 @@ async def import_network_template(session_id: str, network_data: Dict[str, Any])
                 router_id=agent_data.get("r", "1.1.1.1"),
                 protocol=protocols[0]["p"] if protocols else "ospf",
                 protocols=protocols,
-                interfaces=agent_data.get("ifs", []),
+                interfaces=interfaces,
                 protocol_config=protocols[0] if protocols else {}
             )
+
+            # DEBUG GRE: Check if tun survived AgentConfig creation
+            print(f"=== AFTER AgentConfig creation: {len(agent_config.interfaces)} interfaces ===", flush=True)
+            for i, iface in enumerate(agent_config.interfaces):
+                if iface.get("t") == "gre":
+                    print(f"  >>> GRE interface {i}: tun field present: {'tun' in iface}, value: {iface.get('tun')}", flush=True)
+                    logger.info(f"IMPORT DEBUG: After AgentConfig creation - interface {i} ({iface.get('n')}): tun={iface.get('tun')}")
+
             session.agents.append(agent_config)
 
         # Import topology
@@ -905,6 +922,12 @@ def _build_network_from_session(session: WizardState) -> TOONNetwork:
     # Agents
     agents = []
     for agent_config in session.agents:
+        # DEBUG GRE: Check interfaces before TOONInterface creation
+        if agent_config.interfaces:
+            for i, iface_dict in enumerate(agent_config.interfaces):
+                if iface_dict.get("t") == "gre":
+                    logger.info(f"DEPLOY DEBUG: Agent {agent_config.id} interface {i} BEFORE TOONInterface.from_dict: {iface_dict}")
+
         # Interfaces
         interfaces = [
             TOONInterface.from_dict(i) for i in agent_config.interfaces
@@ -912,6 +935,11 @@ def _build_network_from_session(session: WizardState) -> TOONNetwork:
             TOONInterface(id="eth0", n="eth0", t="eth", a=[]),
             TOONInterface(id="lo0", n="lo0", t="lo", a=[f"{agent_config.router_id}/32"])
         ]
+
+        # DEBUG GRE: Check interfaces after TOONInterface creation
+        for i, iface_obj in enumerate(interfaces):
+            if iface_obj.t == "gre":
+                logger.info(f"DEPLOY DEBUG: Agent {agent_config.id} interface {i} AFTER TOONInterface.from_dict: tun={iface_obj.tun}")
 
         # Protocols - support both multi-protocol and single protocol format
         protos = []

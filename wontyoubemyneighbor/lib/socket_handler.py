@@ -45,6 +45,18 @@ class OSPFSocket:
             # Set socket options
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
+            # Bind socket to specific interface to prevent multicast leak
+            # SO_BINDTODEVICE ensures we only receive packets from this interface
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                                   (self.interface + '\0').encode('utf-8'))
+                logger.info(f"Bound socket to interface {self.interface}")
+            except AttributeError:
+                # SO_BINDTODEVICE might not be available on all platforms
+                logger.warning(f"SO_BINDTODEVICE not available, multicast may leak between interfaces")
+            except Exception as e:
+                logger.error(f"Failed to bind to interface {self.interface}: {e}")
+
             # Bind to INADDR_ANY to receive multicast packets
             # We still set IP_MULTICAST_IF below to send from the correct interface
             self.sock.bind(('', 0))

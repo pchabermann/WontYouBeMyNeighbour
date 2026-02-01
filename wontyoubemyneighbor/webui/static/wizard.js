@@ -1367,6 +1367,35 @@ function importNetBoxDevice() {
     showAlert(`Imported agent "${agent.name}" from NetBox`, 'success');
 }
 
+// Helper function to generate interface selection checkboxes
+function generateInterfaceSelection(protocolName) {
+    // Get available interfaces (from currentAgentInterfaces, or default list)
+    let interfaces = ['eth0', 'eth1', 'eth2', 'lo0', 'gre0'];
+
+    // If agent has custom interfaces, use those
+    if (currentAgentInterfaces && currentAgentInterfaces.length > 0) {
+        interfaces = currentAgentInterfaces.map(iface => iface.n || iface.id);
+    }
+
+    const checkboxes = interfaces.map(iface => `
+        <label style="display: inline-block; margin-right: 15px; margin-bottom: 5px;">
+            <input type="checkbox" class="protocol-interface-checkbox" value="${iface}"
+                ${iface === 'eth0' ? 'checked' : ''}>
+            ${iface}
+        </label>
+    `).join('');
+
+    return `
+        <div class="form-group">
+            <label>Select Interfaces for ${protocolName}</label>
+            <div style="background: #1a1a2e; padding: 12px; border-radius: 6px; border: 1px solid #2d2d44;">
+                ${checkboxes}
+            </div>
+            <div class="hint">Select which interfaces this protocol should run on. Leave all unchecked to run on ALL interfaces.</div>
+        </div>
+    `;
+}
+
 function updateProtocolConfig() {
     const protocol = document.getElementById('protocol').value;
     const configDiv = document.getElementById('protocol-config');
@@ -1378,11 +1407,7 @@ function updateProtocolConfig() {
                 <input type="text" id="ospf-area" placeholder="0.0.0.0" value="0.0.0.0">
                 <div class="hint">Use 0.0.0.0 for backbone area</div>
             </div>
-            <div class="form-group">
-                <label for="ospf-interface">OSPF Interface</label>
-                <input type="text" id="ospf-interface" placeholder="eth0" value="eth0">
-                <div class="hint">Interface to run OSPF on</div>
-            </div>
+            ${generateInterfaceSelection('OSPF')}
             <div class="form-group">
                 <label for="ospf-loopback">Loopback IP Address</label>
                 <input type="text" id="ospf-loopback" placeholder="e.g., 10.255.255.1">
@@ -1458,11 +1483,7 @@ function updateProtocolConfig() {
                 </select>
                 <div class="hint">Level 1 = intra-area, Level 2 = inter-area backbone</div>
             </div>
-            <div class="form-group">
-                <label for="isis-interface">IS-IS Interface</label>
-                <input type="text" id="isis-interface" placeholder="eth0" value="eth0">
-                <div class="hint">Interface to run IS-IS on</div>
-            </div>
+            ${generateInterfaceSelection('IS-IS')}
             <div class="form-group">
                 <label for="isis-metric">Interface Metric</label>
                 <input type="number" id="isis-metric" placeholder="10" value="10">
@@ -1476,11 +1497,7 @@ function updateProtocolConfig() {
                 <input type="text" id="mpls-router-id" placeholder="Leave empty to use agent Router ID">
                 <div class="hint">MPLS/LDP Router ID. Leave empty to use the agent's Router ID.</div>
             </div>
-            <div class="form-group">
-                <label for="ldp-interfaces">LDP Interfaces (comma-separated)</label>
-                <input type="text" id="ldp-interfaces" placeholder="eth0, eth1" value="eth0">
-                <div class="hint">Interfaces to enable LDP on</div>
-            </div>
+            ${generateInterfaceSelection('LDP')}
             <div class="form-group">
                 <label for="ldp-neighbors">LDP Neighbor IPs (comma-separated)</label>
                 <input type="text" id="ldp-neighbors" placeholder="e.g., 10.0.0.2, 10.0.0.3">
@@ -1735,12 +1752,15 @@ function addProtocolToAgent() {
         r: routerId
     };
 
+    // Collect selected interfaces from checkboxes (if any)
+    const selectedInterfaces = Array.from(document.querySelectorAll('.protocol-interface-checkbox:checked'))
+        .map(cb => cb.value);
+    if (selectedInterfaces.length > 0) {
+        protocolConfig.interfaces = selectedInterfaces;
+    }
+
     if (protocol === 'ospf' || protocol === 'ospfv3') {
         protocolConfig.a = document.getElementById('ospf-area')?.value || '0.0.0.0';
-        const ospfInterface = document.getElementById('ospf-interface')?.value;
-        if (ospfInterface) {
-            protocolConfig.interface = ospfInterface;
-        }
         const loopbackIp = document.getElementById('ospf-loopback')?.value?.trim();
         if (loopbackIp) {
             protocolConfig.loopback_ip = loopbackIp;
@@ -1792,10 +1812,6 @@ function addProtocolToAgent() {
         }
         protocolConfig.area = document.getElementById('isis-area')?.value || '49.0001';
         protocolConfig.level = parseInt(document.getElementById('isis-level')?.value || '3');
-        const isisInterface = document.getElementById('isis-interface')?.value;
-        if (isisInterface) {
-            protocolConfig.interface = isisInterface;
-        }
         protocolConfig.metric = parseInt(document.getElementById('isis-metric')?.value || '10');
     } else if (protocol === 'mpls') {
         // MPLS/LDP protocol config
@@ -1803,10 +1819,7 @@ function addProtocolToAgent() {
         if (mplsRouterId) {
             protocolConfig.mpls_router_id = mplsRouterId;
         }
-        const ldpInterfaces = document.getElementById('ldp-interfaces')?.value || '';
-        if (ldpInterfaces.trim()) {
-            protocolConfig.ldp_interfaces = ldpInterfaces.split(',').map(i => i.trim()).filter(i => i);
-        }
+        // LDP interfaces now come from checkbox selection (protocolConfig.interfaces already set above)
         const ldpNeighbors = document.getElementById('ldp-neighbors')?.value || '';
         if (ldpNeighbors.trim()) {
             protocolConfig.ldp_neighbors = ldpNeighbors.split(',').map(n => n.trim()).filter(n => n);
@@ -2818,6 +2831,8 @@ async function confirmBulkImport() {
                 a: iface.a || iface.addresses || [],
                 s: iface.s || iface.status || 'up',
                 mtu: iface.mtu || 1500,
+                description: iface.description || '',
+                tun: iface.tun,  // GRE/tunnel configuration
                 l1: iface.l1  // Preserve L1 link info
             }))
         };

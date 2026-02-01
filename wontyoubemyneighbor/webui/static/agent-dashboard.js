@@ -392,6 +392,7 @@ class AgentDashboard {
             markmap: 'Markmap',
             prometheus: 'Prometheus',
             grafana: 'Grafana',
+            programmability: '🔌 API/MCP',  // OpenAPI + MCP Servers
             subnet: '🧮',  // Subnet Calculator - small emoji-only tab
             qos: '📊 QoS',  // QoS RFC 4594 DiffServ
             netflow: '🌊 NetFlow',  // NetFlow/IPFIX RFC 7011
@@ -3321,6 +3322,12 @@ class AgentDashboard {
 
         // Store results for filtering
         this.testResults = results;
+
+        // Show "Discuss Results" button after tests complete
+        const discussBtn = document.getElementById('pyats-discuss-btn');
+        if (discussBtn && results.length > 0) {
+            discussBtn.style.display = 'inline-flex';
+        }
     }
 
     filterTestResults(filter) {
@@ -21098,6 +21105,563 @@ Uptime: ${Math.floor((stats.uptime_seconds || 0) / 60)} minutes
 
     refreshLLMData() {
         this.fetchLLMData();
+    }
+
+    // ==================== CONVERSATION STARTERS ====================
+
+    /**
+     * Start a conversation with tab-specific context
+     * @param {string} contextType - Type of context (ospf-neighbors, bgp-peers, etc.)
+     * @param {object} data - Optional specific data to include
+     */
+    startConversation(contextType, data = null) {
+        // Format context based on type
+        const context = this.formatConversationContext(contextType, data);
+
+        if (!context) {
+            console.error('Failed to generate context for:', contextType);
+            return;
+        }
+
+        // Switch to chat tab
+        this.switchTab('chat');
+
+        // Set the chat input with the context
+        const chatInput = document.getElementById('chat-input');
+        if (chatInput) {
+            chatInput.value = context.prompt;
+            chatInput.focus();
+
+            // Auto-send if configured
+            setTimeout(() => {
+                const sendBtn = document.getElementById('chat-send-btn');
+                if (sendBtn) sendBtn.click();
+            }, 100);
+        }
+
+        console.log('Started conversation with context:', contextType);
+    }
+
+    /**
+     * Format conversation context based on type
+     */
+    formatConversationContext(contextType, customData) {
+        const contexts = {
+            'ospf-neighbors': () => {
+                const neighbors = this.protocols.ospf?.neighbors || [];
+                const neighborCount = neighbors.length;
+                const fullCount = neighbors.filter(n => n.state === 'FULL').length;
+
+                let prompt = `I see ${neighborCount} OSPF neighbor${neighborCount !== 1 ? 's' : ''}`;
+                if (neighborCount > 0) {
+                    prompt += `, ${fullCount} in FULL state. `;
+                    prompt += `Can you explain their status and any issues?\n\nNeighbors:\n`;
+                    neighbors.forEach(n => {
+                        prompt += `- ${n.neighbor_id} (${n.ip_address}): ${n.state}\n`;
+                    });
+                }
+                return { prompt };
+            },
+
+            'ospf-routes': () => {
+                const routes = this.protocols.ospf?.routes || [];
+                const routeCount = routes.length;
+
+                let prompt = `I have ${routeCount} OSPF route${routeCount !== 1 ? 's' : ''}. `;
+                prompt += `Can you explain the routing table and verify everything looks correct?\n\nRoutes:\n`;
+                routes.slice(0, 10).forEach(r => {
+                    prompt += `- ${r.prefix} via ${r.next_hop} (cost: ${r.cost})\n`;
+                });
+                if (routes.length > 10) {
+                    prompt += `... and ${routes.length - 10} more routes\n`;
+                }
+                return { prompt };
+            },
+
+            'interfaces': () => {
+                const interfaces = this.interfaces || [];
+                const upCount = interfaces.filter(i => i.state === 'up').length;
+                const downCount = interfaces.filter(i => i.state === 'down').length;
+
+                let prompt = `I have ${interfaces.length} interfaces: ${upCount} up, ${downCount} down. `;
+                prompt += `Can you analyze the interface status and explain any issues?\n\nInterfaces:\n`;
+                interfaces.forEach(iface => {
+                    prompt += `- ${iface.name} (${iface.type}): ${iface.state} - ${iface.addresses?.join(', ') || 'no IP'}\n`;
+                });
+                return { prompt };
+            },
+
+            'bgp-peers': () => {
+                const peers = this.protocols.bgp?.peers || [];
+                const established = peers.filter(p => p.state === 'Established').length;
+
+                let prompt = `I have ${peers.length} BGP peer${peers.length !== 1 ? 's' : ''}, `;
+                prompt += `${established} established. Can you explain the peering status?\n\nPeers:\n`;
+                peers.forEach(p => {
+                    prompt += `- ${p.peer_ip} (AS${p.remote_as}): ${p.state}\n`;
+                });
+                return { prompt };
+            },
+
+            'bgp-routes': () => {
+                const routes = this.protocols.bgp?.routes || [];
+
+                let prompt = `I have ${routes.length} BGP route${routes.length !== 1 ? 's' : ''} in the Loc-RIB. `;
+                prompt += `Can you analyze the routing table?\n\nRoutes:\n`;
+                routes.slice(0, 10).forEach(r => {
+                    prompt += `- ${r.prefix} via ${r.next_hop} (AS path: ${r.as_path || 'local'})\n`;
+                });
+                if (routes.length > 10) {
+                    prompt += `... and ${routes.length - 10} more routes\n`;
+                }
+                return { prompt };
+            },
+
+            'gre-tunnels': () => {
+                const gre = this.protocols.gre || {};
+                const tunnels = gre.tunnels || [];
+
+                let prompt = `I have ${tunnels.length} GRE tunnel${tunnels.length !== 1 ? 's' : ''}. `;
+                prompt += `Can you test connectivity and explain the tunnel configuration?\n\nTunnels:\n`;
+                tunnels.forEach(t => {
+                    prompt += `- ${t.name}: ${t.local_ip} → ${t.remote_ip} (tunnel IP: ${t.tunnel_ip}, state: ${t.state})\n`;
+                });
+                prompt += `\nPlease:\n1. Verify tunnel connectivity\n2. Check MTU and packet statistics\n3. Explain any issues\n`;
+                return { prompt };
+            },
+
+            'pyats-results': () => {
+                const results = customData || this.getTestResults();
+                const passed = results.filter(r => r.status === 'passed').length;
+                const failed = results.filter(r => r.status === 'failed').length;
+
+                let prompt = `pyATS test results: ${passed} passed, ${failed} failed. `;
+                if (failed > 0) {
+                    prompt += `Can you analyze the failures and suggest fixes?\n\nFailed tests:\n`;
+                    results.filter(r => r.status === 'failed').forEach(t => {
+                        prompt += `- ${t.test}: ${t.error || 'Failed'}\n`;
+                    });
+                } else {
+                    prompt += `All tests passed! Can you summarize what was verified?\n`;
+                }
+                return { prompt };
+            },
+
+            'gait-resume': () => {
+                const commitId = customData?.commitId;
+                if (!commitId) return null;
+
+                let prompt = `Resume conversation from commit ${commitId}. `;
+                prompt += `Please restore the context and continue where we left off.`;
+                return { prompt, action: 'resume', commitId };
+            },
+
+            'ospfv3-neighbors': () => {
+                const neighbors = this.protocols.ospfv3?.neighbors || [];
+                const fullCount = neighbors.filter(n => n.state === 'FULL').length;
+
+                let prompt = `I have ${neighbors.length} OSPFv3 (IPv6) neighbor${neighbors.length !== 1 ? 's' : ''}, `;
+                prompt += `${fullCount} in FULL state. Can you explain their IPv6 status?\n\nNeighbors:\n`;
+                neighbors.forEach(n => {
+                    prompt += `- ${n.neighbor_id} (${n.ipv6_address}): ${n.state}\n`;
+                });
+                return { prompt };
+            },
+
+            'bgp-ipv6-peers': () => {
+                const peers = this.protocols.bgp?.ipv6_peers || [];
+                const established = peers.filter(p => p.state === 'Established').length;
+
+                let prompt = `I have ${peers.length} BGP IPv6 peer${peers.length !== 1 ? 's' : ''}, `;
+                prompt += `${established} established. Can you explain the IPv6 peering?\n\nPeers:\n`;
+                peers.forEach(p => {
+                    prompt += `- ${p.peer_ipv6} (AS${p.remote_as}): ${p.state}\n`;
+                });
+                return { prompt };
+            },
+
+            'bgp-ipv6-routes': () => {
+                const routes = this.protocols.bgp?.ipv6_routes || [];
+
+                let prompt = `I have ${routes.length} BGP IPv6 route${routes.length !== 1 ? 's' : ''} in the Loc-RIB. `;
+                prompt += `Can you analyze the IPv6 routing table?\n\nRoutes:\n`;
+                routes.slice(0, 10).forEach(r => {
+                    prompt += `- ${r.prefix} via ${r.next_hop}\n`;
+                });
+                if (routes.length > 10) {
+                    prompt += `... and ${routes.length - 10} more routes\n`;
+                }
+                return { prompt };
+            },
+
+            'isis-adjacencies': () => {
+                const adjacencies = this.protocols.isis?.adjacencies || [];
+                const upCount = adjacencies.filter(a => a.state === 'Up').length;
+
+                let prompt = `I have ${adjacencies.length} IS-IS adjacenc${adjacencies.length !== 1 ? 'ies' : 'y'}, `;
+                prompt += `${upCount} up. Can you explain the IS-IS topology?\n\nAdjacencies:\n`;
+                adjacencies.forEach(a => {
+                    prompt += `- ${a.system_id} (${a.interface}): ${a.state}, Level ${a.level}\n`;
+                });
+                return { prompt };
+            },
+
+            'bfd-sessions': () => {
+                const sessions = this.protocols.bfd?.sessions || [];
+                const upCount = sessions.filter(s => s.state === 'Up').length;
+
+                let prompt = `I have ${sessions.length} BFD session${sessions.length !== 1 ? 's' : ''}, `;
+                prompt += `${upCount} up. Can you explain the fast failure detection status?\n\nSessions:\n`;
+                sessions.forEach(s => {
+                    prompt += `- ${s.peer_address}: ${s.state}, detection time ${s.detection_time}ms\n`;
+                });
+                return { prompt };
+            },
+
+            'evpn-routes': () => {
+                const routes = this.protocols.evpn?.routes || [];
+
+                let prompt = `I have ${routes.length} EVPN route${routes.length !== 1 ? 's' : ''}. `;
+                prompt += `Can you explain the VXLAN overlay network?\n\nRoutes:\n`;
+                routes.slice(0, 10).forEach(r => {
+                    prompt += `- Type ${r.type}: ${r.rd} (${r.mac_ip})\n`;
+                });
+                if (routes.length > 10) {
+                    prompt += `... and ${routes.length - 10} more routes\n`;
+                }
+                return { prompt };
+            },
+
+            'lldp-neighbors': () => {
+                const neighbors = this.protocols.lldp?.neighbors || [];
+
+                let prompt = `I discovered ${neighbors.length} LLDP neighbor${neighbors.length !== 1 ? 's' : ''}. `;
+                prompt += `Can you explain the Layer 2 topology?\n\nNeighbors:\n`;
+                neighbors.forEach(n => {
+                    prompt += `- ${n.system_name || n.chassis_id} on ${n.local_interface} → ${n.port_description}\n`;
+                });
+                return { prompt };
+            },
+
+            'markmap': () => {
+                let prompt = `Can you explain my current network topology and agent state? `;
+                prompt += `Please analyze:\n`;
+                prompt += `- Routing protocols and their status\n`;
+                prompt += `- Interface configuration\n`;
+                prompt += `- Neighbor relationships\n`;
+                prompt += `- Any potential issues or optimization opportunities\n`;
+                return { prompt };
+            },
+
+            'prometheus': () => {
+                let prompt = `Can you analyze my Prometheus metrics and explain:\n`;
+                prompt += `1. Current performance metrics\n`;
+                prompt += `2. Any unusual patterns or anomalies\n`;
+                prompt += `3. Recommendations for monitoring and alerting\n`;
+                return { prompt };
+            },
+
+            'qos': () => {
+                let prompt = `I'm running RFC 4594 DiffServ QoS. Can you:\n`;
+                prompt += `1. Explain my current QoS configuration\n`;
+                prompt += `2. Verify traffic classification is working\n`;
+                prompt += `3. Recommend any optimizations for traffic types\n`;
+                return { prompt };
+            },
+
+            'netflow': () => {
+                let prompt = `I'm collecting IPFIX/NetFlow data. Can you:\n`;
+                prompt += `1. Analyze my current flow patterns\n`;
+                prompt += `2. Identify top talkers and traffic types\n`;
+                prompt += `3. Detect any unusual traffic or security concerns\n`;
+                return { prompt };
+            },
+
+            'programmability': () => {
+                let prompt = `Can you help me integrate with this agent programmatically?\n\n`;
+                prompt += `I'm interested in:\n`;
+                prompt += `1. REST API endpoints and authentication\n`;
+                prompt += `2. Available MCP servers and their capabilities\n`;
+                prompt += `3. Example code for common automation tasks\n`;
+                prompt += `4. Best practices for monitoring and alerting\n\n`;
+                prompt += `What protocols are running: ${Object.keys(this.protocols).join(', ')}`;
+                return { prompt };
+            }
+        };
+
+        const formatter = contexts[contextType];
+        if (!formatter) {
+            console.warn('Unknown context type:', contextType);
+            return null;
+        }
+
+        return formatter();
+    }
+
+    /**
+     * Get current test results for pyATS
+     */
+    getTestResults() {
+        const table = document.getElementById('test-results-table');
+        if (!table) return [];
+
+        const results = [];
+        const rows = table.querySelectorAll('tr');
+        rows.forEach(row => {
+            const cells = row.querySelectorAll('td');
+            if (cells.length >= 3) {
+                results.push({
+                    test: cells[0].textContent.trim(),
+                    suite: cells[1].textContent.trim(),
+                    status: cells[2].textContent.trim().toLowerCase(),
+                    error: cells[3]?.textContent.trim()
+                });
+            }
+        });
+        return results;
+    }
+
+    /**
+     * Resume GAIT conversation from commit ID
+     */
+    resumeConversation(commitId) {
+        this.startConversation('gait-resume', { commitId });
+    }
+
+    // ==================== PROGRAMMABILITY TAB METHODS ====================
+
+    /**
+     * Switch between OpenAPI and MCP subtabs
+     */
+    switchProgrammabilityTab(subtab) {
+        // Update subtab buttons
+        document.querySelectorAll('.programmability-subtab').forEach(btn => {
+            btn.classList.remove('active');
+            btn.style.borderBottom = '2px solid transparent';
+            btn.style.color = 'var(--text-secondary)';
+        });
+
+        const activeBtn = document.querySelector(`[data-subtab="${subtab}"]`);
+        if (activeBtn) {
+            activeBtn.classList.add('active');
+            activeBtn.style.borderBottom = '2px solid var(--accent-cyan)';
+            activeBtn.style.color = 'var(--accent-cyan)';
+        }
+
+        // Show/hide content
+        document.querySelectorAll('.programmability-subtab-content').forEach(content => {
+            content.style.display = 'none';
+        });
+
+        const content = document.getElementById(`${subtab}-subtab-content`);
+        if (content) {
+            content.style.display = 'block';
+        }
+
+        // Load content if needed
+        if (subtab === 'openapi') {
+            this.loadSwaggerUI();
+        } else if (subtab === 'mcp') {
+            this.loadMCPServers();
+        }
+    }
+
+    /**
+     * Load Swagger UI with OpenAPI spec
+     */
+    async loadSwaggerUI() {
+        // Check if Swagger UI is already loaded
+        if (document.getElementById('swagger-ui').innerHTML) {
+            return; // Already loaded
+        }
+
+        try {
+            // Load Swagger UI library
+            if (!window.SwaggerUIBundle) {
+                const link = document.createElement('link');
+                link.rel = 'stylesheet';
+                link.href = 'https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css';
+                document.head.appendChild(link);
+
+                const script = document.createElement('script');
+                script.src = 'https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js';
+                script.onload = () => this.initSwaggerUI();
+                document.head.appendChild(script);
+            } else {
+                this.initSwaggerUI();
+            }
+        } catch (error) {
+            console.error('Failed to load Swagger UI:', error);
+            document.getElementById('swagger-ui').innerHTML = `
+                <div style="padding: 20px; color: var(--accent-red);">
+                    Failed to load Swagger UI. Please refresh the page.
+                </div>
+            `;
+        }
+    }
+
+    /**
+     * Initialize Swagger UI with agent's OpenAPI spec
+     */
+    async initSwaggerUI() {
+        try {
+            // Fetch OpenAPI spec from agent
+            const response = await fetch(`/api/openapi.json?agent_id=${this.agentId}`);
+            const spec = await response.json();
+
+            // Initialize Swagger UI
+            window.SwaggerUIBundle({
+                spec: spec,
+                dom_id: '#swagger-ui',
+                deepLinking: true,
+                presets: [
+                    window.SwaggerUIBundle.presets.apis,
+                    window.SwaggerUIBundle.SwaggerUIStandalonePreset
+                ],
+                layout: "BaseLayout",
+                defaultModelsExpandDepth: 1,
+                defaultModelExpandDepth: 1
+            });
+
+            // Update API base URL
+            const baseUrl = spec.servers?.[0]?.url || `http://localhost:${this.apiPort || 8888}`;
+            document.getElementById('api-base-url').textContent = baseUrl;
+        } catch (error) {
+            console.error('Failed to load OpenAPI spec:', error);
+            document.getElementById('swagger-ui').innerHTML = `
+                <div style="padding: 20px; color: var(--accent-red);">
+                    Failed to load OpenAPI specification. The agent may not have API documentation available.
+                </div>
+            `;
+        }
+    }
+
+    /**
+     * Load MCP servers information
+     */
+    async loadMCPServers() {
+        try {
+            const response = await fetch(`/api/mcp/servers?agent_id=${this.agentId}`);
+            const data = await response.json();
+
+            const serversList = document.getElementById('mcp-servers-list');
+            if (!data.servers || data.servers.length === 0) {
+                serversList.innerHTML = `
+                    <div style="color: var(--text-secondary); padding: 20px; text-align: center;">
+                        No MCP servers are currently enabled on this agent.
+                    </div>
+                `;
+                return;
+            }
+
+            let html = '';
+            for (const server of data.servers) {
+                const statusColor = server.enabled ? 'var(--accent-green)' : 'var(--text-secondary)';
+                html += `
+                    <div style="background: var(--bg-secondary); padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 3px solid ${statusColor};">
+                        <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 10px;">
+                            <div>
+                                <h5 style="margin: 0; color: ${statusColor};">${server.name}</h5>
+                                <p style="color: var(--text-secondary); font-size: 0.85rem; margin: 5px 0 0 0;">${server.description}</p>
+                            </div>
+                            <span class="status-badge ${server.enabled ? 'active' : 'down'}">${server.enabled ? 'Enabled' : 'Disabled'}</span>
+                        </div>
+                        <div style="margin-top: 10px;">
+                            <strong style="color: var(--text-secondary); font-size: 0.85rem;">Tools:</strong>
+                            <div style="display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px;">
+                                ${server.tools.map(tool => `
+                                    <span style="background: var(--bg-tertiary); padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; color: var(--text-primary);" title="${tool.description || ''}">
+                                        ${tool.name || tool}
+                                    </span>
+                                `).join('')}
+                            </div>
+                        </div>
+                        ${server.url ? `
+                            <div style="margin-top: 10px;">
+                                <strong style="color: var(--text-secondary); font-size: 0.85rem;">Endpoint:</strong>
+                                <code style="color: var(--accent-cyan); margin-left: 5px; font-size: 0.85rem;">${server.url}</code>
+                            </div>
+                        ` : ''}
+                    </div>
+                `;
+            }
+
+            serversList.innerHTML = html;
+
+            // Update Claude Desktop config with actual container name
+            const containerName = data.container_name || 'CONTAINER_NAME';
+            const configElement = document.getElementById('claude-desktop-config');
+            if (configElement) {
+                configElement.textContent = JSON.stringify({
+                    mcpServers: {
+                        "agent-network": {
+                            command: "docker",
+                            args: ["exec", "-i", containerName, "python3", "-m", "agentic.mcp.server"]
+                        }
+                    }
+                }, null, 2);
+            }
+        } catch (error) {
+            console.error('Failed to load MCP servers:', error);
+            document.getElementById('mcp-servers-list').innerHTML = `
+                <div style="color: var(--accent-red); padding: 20px; text-align: center;">
+                    Failed to load MCP servers information.
+                </div>
+            `;
+        }
+    }
+
+    /**
+     * Download OpenAPI specification
+     */
+    async downloadOpenAPISpec() {
+        try {
+            const response = await fetch(`/api/openapi.json?agent_id=${this.agentId}`);
+            const spec = await response.json();
+
+            const blob = new Blob([JSON.stringify(spec, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `agent-${this.agentId}-openapi.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (error) {
+            console.error('Failed to download OpenAPI spec:', error);
+            alert('Failed to download OpenAPI specification');
+        }
+    }
+
+    /**
+     * Copy OpenAPI URL to clipboard
+     */
+    async copyOpenAPIURL() {
+        const url = `http://localhost:${this.apiPort || 8888}/api/openapi.json`;
+        try {
+            await navigator.clipboard.writeText(url);
+            alert('OpenAPI URL copied to clipboard!');
+        } catch (error) {
+            console.error('Failed to copy URL:', error);
+            alert('Failed to copy URL to clipboard');
+        }
+    }
+
+    /**
+     * Copy MCP configuration to clipboard
+     */
+    async copyMCPConfig(client) {
+        const configElement = document.getElementById('claude-desktop-config');
+        if (configElement) {
+            try {
+                await navigator.clipboard.writeText(configElement.textContent);
+                alert('MCP configuration copied to clipboard!');
+            } catch (error) {
+                console.error('Failed to copy config:', error);
+                alert('Failed to copy configuration to clipboard');
+            }
+        }
     }
 
     // ==================== UTILITY METHODS ====================
