@@ -256,6 +256,10 @@ class AgentDashboard {
         // Check for GRE interfaces
         if (status.gre || this.hasGREInterfaces(status.interfaces)) {
             this.protocols.gre = status.gre || this.extractGREData(status.interfaces);
+            // If we detected GRE but don't have full data, fetch from dedicated endpoint
+            if (this.hasGREInterfaces(status.interfaces) && (!this.protocols.gre?.tunnels || this.protocols.gre.tunnels[0]?.local_ip === 'N/A')) {
+                this.fetchGREData();
+            }
         }
 
         // Check for BFD sessions
@@ -2500,6 +2504,25 @@ class AgentDashboard {
                 keepalive: iface.tun?.ka || 0
             }))
         };
+    }
+
+    async fetchGREData() {
+        try {
+            const response = await fetch('/api/gre/tunnels');
+            if (response.ok) {
+                const data = await response.json();
+                if (data.tunnels && data.tunnels.length > 0) {
+                    this.protocols.gre = {
+                        enabled: true,
+                        tunnel_count: data.count,
+                        tunnels: data.tunnels
+                    };
+                    this.updateGREData(this.protocols.gre);
+                }
+            }
+        } catch (e) {
+            console.log('Could not fetch GRE data:', e);
+        }
     }
 
     updateGREData(gre) {

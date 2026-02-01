@@ -2235,6 +2235,16 @@ async def run_unified_agent(args: argparse.Namespace):
             except Exception as e:
                 logger.warning(f"Could not start Web UI: {e}")
 
+        # Start LLDP daemon for neighbor discovery
+        try:
+            from agentic.discovery.lldp import start_lldp
+            await start_lldp(asi_id)
+            logger.info(f"✓ LLDP daemon started for neighbor discovery")
+        except ImportError as e:
+            logger.warning(f"LLDP not available ({e})")
+        except Exception as e:
+            logger.warning(f"Could not start LLDP daemon: {e}")
+
         # Setup signal handlers for graceful shutdown
         loop = asyncio.get_event_loop()
 
