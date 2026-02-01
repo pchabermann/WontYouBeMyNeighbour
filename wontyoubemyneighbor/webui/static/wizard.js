@@ -88,8 +88,18 @@ function updateNetworkNameBadge() {
     const networkNameInput = document.getElementById('network-name');
     const networkNameBadge = document.getElementById('network-name-badge');
 
-    if (networkNameInput && networkNameBadge) {
-        const name = networkNameInput.value.trim();
+    if (networkNameBadge) {
+        let name = '';
+
+        // Try to get from input field first (if on step 1)
+        if (networkNameInput && networkNameInput.value.trim()) {
+            name = networkNameInput.value.trim();
+        }
+        // Fall back to wizardState if available (for steps 2+)
+        else if (wizardState && wizardState.docker_config && wizardState.docker_config.name) {
+            name = wizardState.docker_config.name;
+        }
+
         if (name) {
             networkNameBadge.textContent = `Network: ${name}`;
             networkNameBadge.style.display = 'inline-block';
