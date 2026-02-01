@@ -547,22 +547,30 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
         # OSPF status
         if asi_app.ospf_interface:
             ospf = asi_app.ospf_interface
+
+            # Get neighbors from ALL interfaces (multi-interface support)
+            all_neighbors = {}
+            for iface_name, ctx in ospf.interfaces_ctx.items():
+                for neighbor_id, neighbor in ctx.neighbors.items():
+                    all_neighbors[neighbor_id] = (neighbor, iface_name)
+
             status["ospf"] = {
                 "area": ospf.area_id,
                 "interface": ospf.interface,
                 "ip": ospf.source_ip,
-                "neighbors": len(ospf.neighbors),
-                "full_neighbors": sum(1 for n in ospf.neighbors.values() if n.is_full()),
+                "neighbors": len(all_neighbors),
+                "full_neighbors": sum(1 for (n, _) in all_neighbors.values() if n.is_full()),
                 "lsdb_size": ospf.lsdb.get_size(),
                 "routes": len(ospf.spf_calc.routing_table),
                 "neighbor_details": [
                     {
                         "router_id": n.router_id,
                         "ip": n.ip_address,
+                        "interface": iface,
                         "state": n.get_state_name(),
                         "is_full": n.is_full()
                     }
-                    for n in ospf.neighbors.values()
+                    for (n, iface) in all_neighbors.values()
                 ]
             }
 

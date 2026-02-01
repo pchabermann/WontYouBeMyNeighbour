@@ -1552,13 +1552,20 @@ class OSPFAgent:
         Returns:
             Status dictionary
         """
+        # Get neighbors from ALL interfaces (multi-interface support)
+        all_neighbors = {}
+        for iface_name, ctx in self.interfaces_ctx.items():
+            for neighbor_id, neighbor in ctx.neighbors.items():
+                # Use router_id as key to avoid duplicates across interfaces
+                all_neighbors[neighbor_id] = neighbor
+
         return {
             'router_id': self.router_id,
             'area': self.area_id,
             'interface': self.interface,
             'ip': self.source_ip,
-            'neighbors': len(self.neighbors),
-            'full_neighbors': sum(1 for n in self.neighbors.values() if n.is_full()),
+            'neighbors': len(all_neighbors),
+            'full_neighbors': sum(1 for n in all_neighbors.values() if n.is_full()),
             'lsdb_size': self.lsdb.get_size(),
             'routes': len(self.spf_calc.routing_table)
         }
