@@ -745,11 +745,11 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
                     "tunnels": manager.list_tunnels()
                 }
             else:
-                logger.warning(f"GRE manager not found for agent_id: {gre_agent_id}")
+                logging.getLogger("WebUI").warning(f"GRE manager not found for agent_id: {gre_agent_id}")
         except ImportError as e:
-            logger.warning(f"GRE import error: {e}")
+            logging.getLogger("WebUI").warning(f"GRE import error: {e}")
         except Exception as e:
-            logger.error(f"GRE status error: {e}", exc_info=True)
+            logging.getLogger("WebUI").error(f"GRE status error: {e}", exc_info=True)
 
         return status
 
