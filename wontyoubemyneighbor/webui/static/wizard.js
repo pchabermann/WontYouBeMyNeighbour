@@ -2832,6 +2832,8 @@ async function confirmBulkImport() {
                 asn: p.asn,
                 nets: p.nets || p.networks,
                 peers: p.peers,
+                interfaces: p.interfaces,  // OSPF interfaces list
+                opts: p.opts,  // Protocol options (network_type, etc.)
                 loopback_ip: p.loopback_ip  // Preserve loopback IP for lo0 interface
             })),
             interfaces: (agent.ifs || agent.interfaces || []).map(iface => ({
@@ -2843,7 +2845,8 @@ async function confirmBulkImport() {
                 mtu: iface.mtu || 1500,
                 description: iface.description || '',
                 tun: iface.tun,  // GRE/tunnel configuration
-                l1: iface.l1  // Preserve L1 link info
+                l1: iface.l1,  // Preserve L1 link info
+                ospf_neighbor: iface.ospf_neighbor  // Point-to-point OSPF unicast peer
             }))
         };
 

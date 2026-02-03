@@ -175,7 +175,8 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
         # Start Prometheus metrics collection
         try:
             from agentic.mcp.prometheus_mcp import (
-                get_prometheus_client, collect_system_metrics, collect_interface_metrics
+                get_prometheus_client, collect_system_metrics, collect_interface_metrics,
+                collect_gre_metrics, register_gre_metrics
             )
             import asyncio
 
@@ -185,12 +186,20 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
             router_id = os.environ.get("ASI_ROUTER_ID", "10.255.255.1")
             exporter = prometheus.create_exporter(agent_id, router_id)
 
+            # Register GRE metrics only if agent has GRE interfaces
+            if asi_app and hasattr(asi_app, 'gre_tunnels') and asi_app.gre_tunnels:
+                register_gre_metrics(exporter)
+                logger.info(f"GRE metrics enabled for agent {agent_id}")
+            else:
+                logger.debug(f"GRE metrics disabled for agent {agent_id} (no GRE interfaces)")
+
             # Background task to collect metrics every 10 seconds
             async def metrics_collector():
                 while True:
                     try:
                         await collect_system_metrics(exporter)
                         await collect_interface_metrics(exporter)
+                        await collect_gre_metrics(exporter)
 
                         # Record OSPF metrics from actual protocol state
                         ospf_neighbors = 0
@@ -552,7 +561,10 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
             all_neighbors = {}
             for iface_name, ctx in ospf.interfaces_ctx.items():
                 for neighbor_id, neighbor in ctx.neighbors.items():
-                    all_neighbors[neighbor_id] = (neighbor, iface_name)
+                    # Use neighbor.router_id as key to deduplicate across interfaces
+                    # Keep the first interface where we saw this neighbor
+                    if neighbor.router_id not in all_neighbors:
+                        all_neighbors[neighbor.router_id] = (neighbor, iface_name)
 
             status["ospf"] = {
                 "area": ospf.area_id,
@@ -3153,6 +3165,18 @@ Currently no authentication required for localhost access. For production deploy
             bgp_established_count = 0
             bgp_routes_count = 0
 
+            # GRE Tunnel metrics
+            gre_tunnels_total = 0
+            gre_tunnels_up = 0
+            gre_tx_packets = 0
+            gre_rx_packets = 0
+            gre_tx_bytes = 0
+            gre_rx_bytes = 0
+            gre_tx_errors = 0
+            gre_rx_errors = 0
+            gre_keepalive_sent = 0
+            gre_keepalive_recv = 0
+
             # Iterate through agents and their metrics
             for aid, agent_metrics in all_metrics.items():
                 # If specific agent requested (not 'local'), filter
@@ -3249,6 +3273,28 @@ Currently no authentication required for localhost access. For production deploy
                         if "bgp_routes_total" in name_lower:
                             bgp_routes_count += val if isinstance(val, (int, float)) else 0
 
+                        # Extract GRE tunnel metrics
+                        if "gre_tunnels_total" in name_lower:
+                            gre_tunnels_total += val if isinstance(val, (int, float)) else 0
+                        if "gre_tunnels_up" in name_lower:
+                            gre_tunnels_up += val if isinstance(val, (int, float)) else 0
+                        if "gre_tx_packets" in name_lower:
+                            gre_tx_packets += val if isinstance(val, (int, float)) else 0
+                        if "gre_rx_packets" in name_lower:
+                            gre_rx_packets += val if isinstance(val, (int, float)) else 0
+                        if "gre_tx_bytes" in name_lower:
+                            gre_tx_bytes += val if isinstance(val, (int, float)) else 0
+                        if "gre_rx_bytes" in name_lower:
+                            gre_rx_bytes += val if isinstance(val, (int, float)) else 0
+                        if "gre_tx_errors" in name_lower:
+                            gre_tx_errors += val if isinstance(val, (int, float)) else 0
+                        if "gre_rx_errors" in name_lower:
+                            gre_rx_errors += val if isinstance(val, (int, float)) else 0
+                        if "gre_keepalive_sent" in name_lower:
+                            gre_keepalive_sent += val if isinstance(val, (int, float)) else 0
+                        if "gre_keepalive_recv" in name_lower:
+                            gre_keepalive_recv += val if isinstance(val, (int, float)) else 0
+
             return {
                 "metrics": metrics_list,
                 "neighbor_count": neighbor_count,
@@ -3287,6 +3333,20 @@ Currently no authentication required for localhost access. For production deploy
                     "peer_count": bgp_peer_count,
                     "established_count": bgp_established_count,
                     "routes_count": bgp_routes_count
+                },
+                # GRE Tunnel specific metrics
+                "gre": {
+                    "active": gre_tunnels_total > 0,
+                    "tunnels_total": gre_tunnels_total,
+                    "tunnels_up": gre_tunnels_up,
+                    "tx_packets": gre_tx_packets,
+                    "rx_packets": gre_rx_packets,
+                    "tx_bytes": gre_tx_bytes,
+                    "rx_bytes": gre_rx_bytes,
+                    "tx_errors": gre_tx_errors,
+                    "rx_errors": gre_rx_errors,
+                    "keepalive_sent": gre_keepalive_sent,
+                    "keepalive_recv": gre_keepalive_recv
                 }
             }
         except ImportError as e:

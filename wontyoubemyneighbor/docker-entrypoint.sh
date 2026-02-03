@@ -33,6 +33,13 @@ for var in $(env | grep "^GRE_TUNNEL_" | cut -d= -f1); do
     tunnel_config="${!var}"
     IFS=':' read -r tunnel_name local_ip remote_ip tunnel_ip key ttl mtu <<< "$tunnel_config"
 
+    # Special handling: gre0 is a default Linux interface that can't be deleted/recreated
+    # Automatically rename gre0 to gre1 for user-defined tunnels
+    if [ "$tunnel_name" = "gre0" ]; then
+        echo "Note: Renaming tunnel from gre0 to gre1 (gre0 is a special Linux interface)"
+        tunnel_name="gre1"
+    fi
+
     echo "Setting up GRE tunnel: $tunnel_name ($local_ip -> $remote_ip)"
 
     # Wait for local IP to be configured (external network connection)
@@ -87,6 +94,64 @@ for var in $(env | grep "^GRE_TUNNEL_" | cut -d= -f1); do
         ip link set gre0 down 2>/dev/null || true
     fi
 done
+
+# Configure interface IPs from ASI_AGENT_CONFIG
+if [ -n "$ASI_AGENT_CONFIG" ]; then
+    echo "========== Configuring interface IPs from ASI_AGENT_CONFIG =========="
+
+    # Extract interface configs using Python
+    python3 << 'PYTHON_SCRIPT'
+import json
+import os
+import subprocess
+
+config = json.loads(os.environ['ASI_AGENT_CONFIG'])
+interfaces = config.get('ifs', [])
+
+for iface in interfaces:
+    iface_name = iface.get('n') or iface.get('id')
+    addresses = iface.get('a', [])
+    iface_type = iface.get('t', 'eth')
+
+    # Skip loopback interfaces (handled separately)
+    if iface_type == 'lo':
+        continue
+
+    # Check if interface exists
+    try:
+        subprocess.run(['ip', 'link', 'show', iface_name],
+                      check=True, capture_output=True)
+        target_iface = iface_name
+    except subprocess.CalledProcessError:
+        # Interface doesn't exist - add IPs to eth0 instead (logical interface)
+        print(f"  Interface {iface_name} does not exist, adding IPs to eth0 instead (logical interface)")
+        target_iface = 'eth0'
+
+    # Add each IP address to the interface
+    for addr in addresses:
+        if not addr:
+            continue
+
+        # Check if IP is already configured on target interface
+        result = subprocess.run(['ip', 'addr', 'show', target_iface],
+                              capture_output=True, text=True)
+        if addr in result.stdout:
+            print(f"  ✓ {target_iface} already has {addr} (logical: {iface_name})")
+            continue
+
+        # Add the IP address to target interface
+        try:
+            subprocess.run(['ip', 'addr', 'add', addr, 'dev', target_iface],
+                          check=True, capture_output=True)
+            print(f"  ✓ Added {addr} to {target_iface} (logical: {iface_name})")
+        except subprocess.CalledProcessError as e:
+            print(f"  ✗ Failed to add {addr} to {target_iface} (logical: {iface_name}): {e}")
+
+print("Interface IP configuration complete")
+PYTHON_SCRIPT
+
+    echo "===================================================================="
+fi
 
 # Execute the main command (passed as arguments)
 exec "$@"

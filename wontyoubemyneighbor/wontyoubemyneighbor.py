@@ -549,7 +549,9 @@ class OSPFAgent:
                  source_ip: Optional[str] = None,
                  unicast_peer: Optional[str] = None,
                  kernel_route_manager: Optional[KernelRouteManager] = None,
-                 interfaces: Optional[List[str]] = None):
+                 interfaces: Optional[List[str]] = None,
+                 interface_unicast_peers: Optional[Dict[str, str]] = None,
+                 interface_ips: Optional[Dict[str, str]] = None):
         """
         Initialize OSPF agent (now supports multiple interfaces!)
 
@@ -584,15 +586,38 @@ class OSPFAgent:
         # Build interface list (support both old single-interface and new multi-interface)
         interface_list = interfaces if interfaces else [interface]
 
+        # Parse per-interface unicast peers
+        iface_unicast_peers = interface_unicast_peers or {}
+
+        # Parse per-interface IPs
+        iface_ips = interface_ips or {}
+
         # Initialize each interface
         for iface_name in interface_list:
+            # Determine unicast peer for this interface
+            iface_unicast = iface_unicast_peers.get(iface_name)
+            if not iface_unicast and iface_name == interface:
+                iface_unicast = unicast_peer  # Backwards compatibility
+
+            # Determine source IP for this interface
+            iface_source_ip = None
+            if iface_name == interface:
+                iface_source_ip = source_ip  # Primary interface uses explicitly provided source_ip
+                # If source_ip not provided, use interface_ips dict
+                if not iface_source_ip and iface_name in iface_ips:
+                    iface_source_ip = iface_ips[iface_name]
+                    self.logger.info(f"Using source IP {iface_source_ip} for primary interface {iface_name} (from config)")
+            elif iface_name in iface_ips:
+                iface_source_ip = iface_ips[iface_name]  # Logical interface uses IP from config
+                self.logger.info(f"Using source IP {iface_source_ip} for logical interface {iface_name}")
+
             self._add_interface_context(
                 iface_name=iface_name,
                 hello_interval=hello_interval,
                 dead_interval=dead_interval,
                 network_type=network_type,
-                source_ip=source_ip if iface_name == interface else None,
-                unicast_peer=unicast_peer if iface_name == interface else None
+                source_ip=iface_source_ip,
+                unicast_peer=iface_unicast
             )
 
         # Backwards compatibility - keep these for old code
@@ -630,6 +655,33 @@ class OSPFAgent:
 
         return None
 
+    def _is_neighbor_in_subnet(self, neighbor_ip: str, ctx) -> bool:
+        """
+        Check if neighbor IP is in the same subnet as the interface
+
+        Args:
+            neighbor_ip: Neighbor's IP address
+            ctx: OSPFInterfaceContext object
+
+        Returns:
+            True if neighbor is in same subnet, False otherwise
+        """
+        import ipaddress
+        try:
+            # Get interface network
+            iface_network = ipaddress.IPv4Network(
+                f"{ctx.source_ip}/{ctx.netmask}",
+                strict=False
+            )
+            neighbor_addr = ipaddress.IPv4Address(neighbor_ip)
+            is_in_subnet = neighbor_addr in iface_network
+            if not is_in_subnet:
+                self.logger.debug(f"Neighbor {neighbor_ip} NOT in {iface_network}")
+            return is_in_subnet
+        except Exception as e:
+            self.logger.warning(f"Error checking subnet for {neighbor_ip}: {e}")
+            return True  # Allow by default on error
+
     def _send_to_neighbor(self, packet: bytes, neighbor: 'OSPFNeighbor', iface_name: str = None):
         """
         Send packet to neighbor on the correct interface
@@ -657,9 +709,25 @@ class OSPFAgent:
         """Add an interface to OSPF"""
         # Get interface info
         interface_info = get_interface_info(iface_name, source_ip)
+        physical_if_name = iface_name  # Track physical interface for socket binding
+
         if not interface_info:
-            self.logger.error(f"Invalid interface: {iface_name}, skipping")
-            return
+            # Interface doesn't exist - try to find physical interface with this source IP
+            # This handles logical interfaces (like eth2) whose IPs are on eth0
+            if source_ip:
+                self.logger.info(f"Logical interface {iface_name} not found, searching for IP {source_ip} on physical interfaces")
+                # Try common physical interfaces
+                for physical_if in ['eth0', 'eth1', 'eth2', 'eth3']:
+                    interface_info = get_interface_info(physical_if, source_ip)
+                    if interface_info:
+                        self.logger.info(f"Found {source_ip} on {physical_if}, using it for logical interface {iface_name}")
+                        # Keep using logical iface_name for identification, but bind socket to physical interface
+                        physical_if_name = physical_if
+                        break
+
+            if not interface_info:
+                self.logger.error(f"Invalid interface: {iface_name}, skipping")
+                return
 
         # Auto-detect network type for special interfaces
         effective_network_type = network_type
@@ -668,8 +736,8 @@ class OSPFAgent:
             effective_network_type = "point-to-point"
             self.logger.info(f"  Interface {iface_name} detected as tunnel, using point-to-point network type")
 
-        # Create per-interface components
-        socket = OSPFSocket(iface_name, interface_info.ip_address)
+        # Create per-interface components (use physical_if_name for socket binding)
+        socket = OSPFSocket(physical_if_name, interface_info.ip_address)
         hello_handler = HelloHandler(
             self.router_id, self.area_id, iface_name, interface_info.netmask,
             hello_interval, dead_interval, network_type=effective_network_type
@@ -1207,6 +1275,12 @@ class OSPFAgent:
         if not ctx:
             return
 
+        # Validate neighbor IP is in same subnet as interface
+        # This prevents duplicate neighbors when OSPF packets leak across interfaces
+        if not self._is_neighbor_in_subnet(ip, ctx):
+            self.logger.debug(f"[{iface_name}] Ignoring neighbor discovery for {neighbor_id} ({ip}) - not in subnet {ctx.source_ip}/{ctx.netmask}")
+            return
+
         if neighbor_id not in ctx.neighbors:
             neighbor = OSPFNeighbor(neighbor_id, ip, priority, network_type=ctx.network_type)
             ctx.neighbors[neighbor_id] = neighbor
@@ -1225,6 +1299,12 @@ class OSPFAgent:
         """
         ctx = self.interfaces_ctx.get(iface_name)
         if not ctx:
+            return
+
+        # Validate neighbor IP is in same subnet as interface
+        # This prevents duplicate neighbors when multiple interfaces share physical NIC
+        if not self._is_neighbor_in_subnet(ip, ctx):
+            self.logger.debug(f"[{iface_name}] Ignoring Hello from {neighbor_id} ({ip}) - not in subnet {ctx.source_ip}/{ctx.netmask}")
             return
 
         # Get or create neighbor
@@ -1556,8 +1636,9 @@ class OSPFAgent:
         all_neighbors = {}
         for iface_name, ctx in self.interfaces_ctx.items():
             for neighbor_id, neighbor in ctx.neighbors.items():
-                # Use router_id as key to avoid duplicates across interfaces
-                all_neighbors[neighbor_id] = neighbor
+                # Use neighbor.router_id as key to avoid duplicates across interfaces
+                # (same router seen on multiple interfaces should only count once)
+                all_neighbors[neighbor.router_id] = neighbor
 
         return {
             'router_id': self.router_id,
@@ -1755,6 +1836,30 @@ async def run_unified_agent(args: argparse.Namespace):
         # Initialize OSPFv2 if requested
         if run_ospf:
             logger.info("Initializing OSPFv2 agent...")
+
+            # Parse per-interface unicast peers
+            interface_unicast_peers = {}
+            if hasattr(args, 'interface_unicast_peer') and args.interface_unicast_peer:
+                for peer_spec in args.interface_unicast_peer:
+                    if ':' in peer_spec:
+                        iface, peer_ip = peer_spec.split(':', 1)
+                        interface_unicast_peers[iface] = peer_ip
+                        logger.info(f"Configured unicast peer for {iface}: {peer_ip}")
+
+            # Extract interface IPs from agent config for logical interfaces
+            interface_ips = {}
+            if hasattr(asi_app, 'interfaces') and asi_app.interfaces:
+                for iface_config in asi_app.interfaces:
+                    # asi_app.interfaces uses full names ('name', 'addresses') not TOON keys ('n', 'a')
+                    iface_name = iface_config.get('name') or iface_config.get('id')
+                    iface_addresses = iface_config.get('addresses', [])
+                    if iface_addresses and len(iface_addresses) > 0:
+                        # Extract IP without netmask
+                        ip_with_mask = iface_addresses[0]
+                        ip = ip_with_mask.split('/')[0] if '/' in ip_with_mask else ip_with_mask
+                        interface_ips[iface_name] = ip
+                        logger.info(f"Interface {iface_name} has IP: {ip}")
+
             ospf_agent = OSPFAgent(
                 router_id=args.router_id,
                 area_id=args.area,
@@ -1765,7 +1870,9 @@ async def run_unified_agent(args: argparse.Namespace):
                 source_ip=args.source_ip,
                 unicast_peer=args.unicast_peer,
                 kernel_route_manager=kernel_route_manager,
-                interfaces=ospf_interfaces  # Pass all interfaces!
+                interfaces=ospf_interfaces,  # Pass all interfaces!
+                interface_unicast_peers=interface_unicast_peers,
+                interface_ips=interface_ips  # Pass interface IPs for logical interfaces
             )
             asi_app.set_ospf(ospf_agent)
             asi_app.area_id = args.area
@@ -2458,7 +2565,9 @@ Notes:
                        choices=['broadcast', 'point-to-multipoint', 'point-to-point', 'nbma'],
                        help="OSPF Network type (default: broadcast)")
     ospf_group.add_argument("--unicast-peer", default=None,
-                       help="OSPF Unicast peer IP for point-to-point")
+                       help="OSPF Unicast peer IP for point-to-point (applies to primary interface)")
+    ospf_group.add_argument("--interface-unicast-peer", action="append",
+                       help="Per-interface unicast peer (format: interface:peer_ip, e.g., eth0:10.0.1.2)")
 
     # OSPFv3 arguments (IPv6)
     ospfv3_group = parser.add_argument_group('OSPFv3 Options (IPv6)')

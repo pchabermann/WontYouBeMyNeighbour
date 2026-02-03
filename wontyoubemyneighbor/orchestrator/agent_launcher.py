@@ -173,22 +173,64 @@ class AgentLauncher:
                 # Check if protocol specifies interfaces explicitly
                 if hasattr(proto, 'interfaces') and proto.interfaces:
                     # Use user-specified interfaces from wizard
-                    ospf_interfaces = proto.interfaces
-                    self.logger.info(f"OSPF configured for specific interfaces: {ospf_interfaces}")
+                    # Special handling: rename gre0 to gre1 (gre0 is a special Linux interface)
+                    ospf_interfaces = ["gre1" if iface == "gre0" else iface for iface in proto.interfaces]
+                    if "gre0" in proto.interfaces:
+                        self.logger.info(f"OSPF configured for specific interfaces: {proto.interfaces} (gre0 auto-renamed to gre1)")
+                    else:
+                        self.logger.info(f"OSPF configured for specific interfaces: {ospf_interfaces}")
                 else:
                     # Legacy/automatic mode: include eth0 and all GRE interfaces
                     ospf_interfaces = ["eth0"]  # Always include eth0
 
                     # Check for GRE tunnel interfaces in agent.ifs
                     for iface in agent.ifs:
-                        if iface.t == "gre" and iface.n not in ospf_interfaces:
-                            ospf_interfaces.append(iface.n)
-                            # GRE tunnels should use point-to-point network type
-                            self.logger.info(f"Adding GRE interface {iface.n} to OSPF (auto-detected)")
+                        if iface.t == "gre":
+                            # Special handling: gre0 is a default Linux interface that can't be deleted
+                            # Automatically rename gre0 to gre1 (must match docker-entrypoint.sh behavior)
+                            iface_name = "gre1" if iface.n == "gre0" else iface.n
+
+                            if iface_name not in ospf_interfaces:
+                                ospf_interfaces.append(iface_name)
+                                # GRE tunnels should use point-to-point network type
+                                if iface.n == "gre0":
+                                    self.logger.info(f"Adding GRE interface {iface.n} to OSPF as gre1 (auto-renamed, auto-detected)")
+                                else:
+                                    self.logger.info(f"Adding GRE interface {iface_name} to OSPF (auto-detected)")
 
                 # Add all interfaces to command
                 for iface_name in ospf_interfaces:
                     cmd.extend(["--interface", iface_name])
+
+                # Add per-interface unicast peers from interface definitions
+                self.logger.info(f"DEBUG: Checking {len(agent.ifs)} interfaces for unicast peers")
+                for iface in agent.ifs:
+                    iface_name = "gre1" if iface.n == "gre0" else iface.n
+                    self.logger.info(f"DEBUG: Interface {iface_name}, type: {type(iface).__name__}, dir: {dir(iface)}")
+
+                    if iface_name in ospf_interfaces:
+                        # Check if interface has ospf_neighbor defined (try both attribute and dict access)
+                        ospf_neighbor = None
+                        if hasattr(iface, 'ospf_neighbor'):
+                            ospf_neighbor = iface.ospf_neighbor
+                            self.logger.info(f"DEBUG: Found ospf_neighbor via hasattr: {ospf_neighbor}")
+                        elif hasattr(iface, '__dict__') and 'ospf_neighbor' in iface.__dict__:
+                            ospf_neighbor = iface.__dict__['ospf_neighbor']
+                            self.logger.info(f"DEBUG: Found ospf_neighbor via __dict__: {ospf_neighbor}")
+                        elif isinstance(iface, dict) and 'ospf_neighbor' in iface:
+                            ospf_neighbor = iface['ospf_neighbor']
+                            self.logger.info(f"DEBUG: Found ospf_neighbor via dict: {ospf_neighbor}")
+                        else:
+                            self.logger.warning(f"DEBUG: Could not find ospf_neighbor on {iface_name}, checking raw attributes...")
+                            # Try to access all attributes
+                            if hasattr(iface, '__dict__'):
+                                self.logger.warning(f"DEBUG: iface.__dict__ = {iface.__dict__}")
+
+                        if ospf_neighbor:
+                            cmd.extend(["--interface-unicast-peer", f"{iface_name}:{ospf_neighbor}"])
+                            self.logger.info(f"✓ Configured OSPF unicast neighbor for {iface_name}: {ospf_neighbor}")
+                        else:
+                            self.logger.warning(f"✗ No OSPF unicast neighbor found for {iface_name}")
 
                 if proto.opts.get("network_type"):
                     cmd.extend(["--network-type", proto.opts["network_type"]])

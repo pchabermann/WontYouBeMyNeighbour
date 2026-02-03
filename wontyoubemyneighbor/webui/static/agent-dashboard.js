@@ -423,7 +423,10 @@ class AgentDashboard {
             </button>
         `;
 
-        // Add LLDP tab right after Interfaces (underlay discovery)
+        // LLDP tab disabled - Docker bridge networking filters LLDP multicast frames (01:80:c2:00:00:0e)
+        // The ASI overlay provides neighbor discovery via IPv6 ND (RFC 4861) instead
+        // To re-enable LLDP, uncomment below and use Docker host networking mode
+        /*
         const lldpActive = this.activeProtocol === 'lldp' ? 'active' : '';
         html += `
             <button class="protocol-tab lldp ${lldpActive}" data-protocol="lldp">
@@ -431,6 +434,7 @@ class AgentDashboard {
                 LLDP
             </button>
         `;
+        */
 
         for (const [proto, data] of Object.entries(this.protocols)) {
             const active = proto === this.activeProtocol ? 'active' : '';
@@ -455,9 +459,10 @@ class AgentDashboard {
             `;
         }
 
-        // Optional MCP tabs - shown only when enabled
+        // Optional MCP tabs - shown only when enabled AND configured
         // Email tab (SMTP MCP)
-        if (this.enabledMcps.has('smtp')) {
+        const smtpMcp = this.mcpStatus?.optional?.mcps?.find(m => m.type === 'smtp');
+        if (smtpMcp && smtpMcp.enabled && smtpMcp.has_config) {
             const emailActive = this.activeProtocol === 'email' ? 'active' : '';
             html += `
                 <button class="protocol-tab email ${emailActive}" data-protocol="email">
@@ -467,14 +472,18 @@ class AgentDashboard {
             `;
         }
 
-        // NetBox tab - always show (core DCIM/IPAM integration feature)
-        const netboxActive = this.activeProtocol === 'netbox' ? 'active' : '';
-        html += `
-            <button class="protocol-tab netbox ${netboxActive}" data-protocol="netbox">
-                <span class="protocol-indicator active"></span>
-                📦 NetBox
-            </button>
-        `;
+        // NetBox tab - shown only when NetBox MCP is enabled AND configured
+        // Check both that it's enabled and that it has actual configuration (URL/token)
+        const netboxMcp = this.mcpStatus?.optional?.mcps?.find(m => m.type === 'netbox');
+        if (netboxMcp && netboxMcp.enabled && netboxMcp.has_config) {
+            const netboxActive = this.activeProtocol === 'netbox' ? 'active' : '';
+            html += `
+                <button class="protocol-tab netbox ${netboxActive}" data-protocol="netbox">
+                    <span class="protocol-indicator active"></span>
+                    📦 NetBox
+                </button>
+            `;
+        }
 
         tabsContainer.innerHTML = html;
 
@@ -2705,8 +2714,8 @@ class AgentDashboard {
         // Grafana tab event listeners
         this.setupGrafanaEvents();
 
-        // LLDP tab event listeners
-        this.setupLLDPEvents();
+        // LLDP tab disabled - see tab rendering section for details
+        // this.setupLLDPEvents();
 
         // LACP tab event listeners
         this.setupLACPEvents();

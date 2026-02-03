@@ -80,6 +80,7 @@ class TOONInterface:
     - s: state (up/down)
     - mtu: maximum transmission unit
     - tun: tunnel config (for tunnel interfaces)
+    - ospf_neighbor: unicast OSPF neighbor IP (point-to-point)
     """
     id: str
     n: str  # name
@@ -90,6 +91,7 @@ class TOONInterface:
     mtu: int = 1500
     description: str = ""  # interface description
     tun: Optional[Dict[str, Any]] = None  # tunnel config
+    ospf_neighbor: Optional[str] = None  # unicast OSPF peer IP
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -147,6 +149,7 @@ class TOONProtocolConfig:
     - asn: AS number (for BGP)
     - peers: list of peer configs
     - nets: networks to advertise
+    - interfaces: list of interface names (for OSPF multi-interface)
     - opts: additional options
     """
     p: str  # protocol
@@ -155,6 +158,7 @@ class TOONProtocolConfig:
     asn: Optional[int] = None  # AS number
     peers: List[Dict[str, Any]] = field(default_factory=list)
     nets: List[str] = field(default_factory=list)  # networks
+    interfaces: Optional[List[str]] = None  # OSPF interfaces list
     opts: Dict[str, Any] = field(default_factory=dict)  # options
 
     def to_dict(self) -> Dict[str, Any]:

@@ -214,11 +214,18 @@ async def import_network_template(session_id: str, network_data: Dict[str, Any])
             for proto in agent_data.get("protos", []):
                 protocols.append(proto)
 
-            # DEBUG GRE: Check if interfaces have tun config
+            # DEBUG: Check if interfaces have tun config and ospf_neighbor
             interfaces = agent_data.get("ifs", [])
             print(f"\n=== IMPORT JSON DEBUG: Agent {agent_data['id']} has {len(interfaces)} interfaces ===", flush=True)
+            logger.info(f"IMPORT JSON DEBUG: Agent {agent_data['id']} has {len(interfaces)} interfaces")
             for i, iface in enumerate(interfaces):
                 print(f"  Interface {i}: {iface.get('n')} (type={iface.get('t')})", flush=True)
+                # Check for ospf_neighbor field
+                if 'ospf_neighbor' in iface:
+                    print(f"  >>> OSPF_NEIGHBOR FOUND: {iface.get('ospf_neighbor')}", flush=True)
+                    logger.info(f"IMPORT DEBUG: Agent {agent_data['id']} interface {i} ({iface.get('n')}): ospf_neighbor={iface.get('ospf_neighbor')}")
+                else:
+                    logger.warning(f"IMPORT DEBUG: Agent {agent_data['id']} interface {i} ({iface.get('n')}): NO ospf_neighbor field")
                 if iface.get("t") == "gre":
                     print(f"  >>> GRE INTERFACE FOUND! tun field present: {'tun' in iface}, value: {iface.get('tun')}", flush=True)
                     logger.info(f"IMPORT DEBUG: Agent {agent_data['id']} interface {i} ({iface.get('n')}): tun={iface.get('tun')}")
@@ -234,9 +241,17 @@ async def import_network_template(session_id: str, network_data: Dict[str, Any])
                 protocol_config=protocols[0] if protocols else {}
             )
 
-            # DEBUG GRE: Check if tun survived AgentConfig creation
+            # DEBUG: Check if tun and ospf_neighbor survived AgentConfig creation
             print(f"=== AFTER AgentConfig creation: {len(agent_config.interfaces)} interfaces ===", flush=True)
+            logger.info(f"IMPORT DEBUG: After AgentConfig - {len(agent_config.interfaces)} interfaces")
             for i, iface in enumerate(agent_config.interfaces):
+                # Check for ospf_neighbor field
+                if 'ospf_neighbor' in iface:
+                    print(f"  >>> Interface {i} ({iface.get('n')}): ospf_neighbor={iface.get('ospf_neighbor')} ✓", flush=True)
+                    logger.info(f"IMPORT DEBUG: After AgentConfig - interface {i} ({iface.get('n')}): ospf_neighbor={iface.get('ospf_neighbor')} PRESERVED")
+                else:
+                    print(f"  >>> Interface {i} ({iface.get('n')}): NO ospf_neighbor ✗", flush=True)
+                    logger.warning(f"IMPORT DEBUG: After AgentConfig - interface {i} ({iface.get('n')}): ospf_neighbor MISSING")
                 if iface.get("t") == "gre":
                     print(f"  >>> GRE interface {i}: tun field present: {'tun' in iface}, value: {iface.get('tun')}", flush=True)
                     logger.info(f"IMPORT DEBUG: After AgentConfig creation - interface {i} ({iface.get('n')}): tun={iface.get('tun')}")
@@ -922,9 +937,14 @@ def _build_network_from_session(session: WizardState) -> TOONNetwork:
     # Agents
     agents = []
     for agent_config in session.agents:
-        # DEBUG GRE: Check interfaces before TOONInterface creation
+        # DEBUG: Check ALL interfaces before TOONInterface creation
         if agent_config.interfaces:
+            logger.info(f"DEPLOY DEBUG: Agent {agent_config.id} has {len(agent_config.interfaces)} interfaces to process")
             for i, iface_dict in enumerate(agent_config.interfaces):
+                iface_name = iface_dict.get("n", iface_dict.get("id", f"iface-{i}"))
+                has_ospf_neighbor = "ospf_neighbor" in iface_dict
+                ospf_neighbor_val = iface_dict.get("ospf_neighbor")
+                logger.info(f"DEPLOY DEBUG: Agent {agent_config.id} interface {i} ({iface_name}) BEFORE TOONInterface.from_dict: ospf_neighbor={'PRESENT: '+str(ospf_neighbor_val) if has_ospf_neighbor else 'MISSING'}")
                 if iface_dict.get("t") == "gre":
                     logger.info(f"DEPLOY DEBUG: Agent {agent_config.id} interface {i} BEFORE TOONInterface.from_dict: {iface_dict}")
 
@@ -936,8 +956,12 @@ def _build_network_from_session(session: WizardState) -> TOONNetwork:
             TOONInterface(id="lo0", n="lo0", t="lo", a=[f"{agent_config.router_id}/32"])
         ]
 
-        # DEBUG GRE: Check interfaces after TOONInterface creation
+        # DEBUG: Check ALL interfaces after TOONInterface creation
+        logger.info(f"DEPLOY DEBUG: Agent {agent_config.id} has {len(interfaces)} TOONInterface objects created")
         for i, iface_obj in enumerate(interfaces):
+            has_ospf_neighbor_attr = hasattr(iface_obj, 'ospf_neighbor')
+            ospf_neighbor_val = getattr(iface_obj, 'ospf_neighbor', None) if has_ospf_neighbor_attr else None
+            logger.info(f"DEPLOY DEBUG: Agent {agent_config.id} interface {i} ({iface_obj.n}) AFTER TOONInterface.from_dict: ospf_neighbor={'PRESERVED: '+str(ospf_neighbor_val) if has_ospf_neighbor_attr and ospf_neighbor_val else 'MISSING or None'}")
             if iface_obj.t == "gre":
                 logger.info(f"DEPLOY DEBUG: Agent {agent_config.id} interface {i} AFTER TOONInterface.from_dict: tun={iface_obj.tun}")
 
@@ -952,7 +976,9 @@ def _build_network_from_session(session: WizardState) -> TOONNetwork:
                     a=proto_data.get("a", "0.0.0.0"),
                     asn=proto_data.get("asn"),
                     peers=proto_data.get("peers", []),
-                    nets=proto_data.get("nets", [])
+                    nets=proto_data.get("nets", []),
+                    interfaces=proto_data.get("interfaces"),  # OSPF interface list
+                    opts=proto_data.get("opts", {})  # Protocol options
                 ))
         else:
             # Backwards compatibility: single protocol format
