@@ -256,6 +256,10 @@ class AgentDashboard {
         // Check for GRE interfaces
         if (status.gre || this.hasGREInterfaces(status.interfaces)) {
             this.protocols.gre = status.gre || this.extractGREData(status.interfaces);
+            // If we detected GRE but don't have full data, fetch from dedicated endpoint
+            if (this.hasGREInterfaces(status.interfaces) && (!this.protocols.gre?.tunnels || this.protocols.gre.tunnels[0]?.local_ip === 'N/A')) {
+                this.fetchGREData();
+            }
         }
 
         // Check for BFD sessions
@@ -385,18 +389,27 @@ class AgentDashboard {
             bfd: 'BFD'
         };
 
-        // Core MCP/feature tabs - always shown (LLDP is added separately after Interfaces)
+        // Core MCP/feature tabs - always shown
         const mcpTabs = {
             testing: 'Testing',
             gait: 'GAIT',
             markmap: 'Markmap',
             prometheus: 'Prometheus',
             grafana: 'Grafana',
-            subnet: '🧮',  // Subnet Calculator - small emoji-only tab
-            qos: '📊 QoS',  // QoS RFC 4594 DiffServ
-            netflow: '🌊 NetFlow',  // NetFlow/IPFIX RFC 7011
+            programmability: '🔌 API/MCP',
+            subnet: '🧮',
             logs: 'Logs'
         };
+
+        // Conditional tabs based on agent config
+        // QoS - only show if agent has OSPF or BGP (routing = QoS relevance)
+        if (this.protocols.ospf || this.protocols.bgp) {
+            mcpTabs['qos'] = '📊 QoS';
+        }
+        // NetFlow - only show if agent has GRE interfaces
+        if (this.protocols.gre) {
+            mcpTabs['netflow'] = '🌊 NetFlow';
+        }
 
         let html = '';
 
@@ -418,7 +431,10 @@ class AgentDashboard {
             </button>
         `;
 
-        // Add LLDP tab right after Interfaces (underlay discovery)
+        // LLDP tab disabled - Docker bridge networking filters LLDP multicast frames (01:80:c2:00:00:0e)
+        // The ASI overlay provides neighbor discovery via IPv6 ND (RFC 4861) instead
+        // To re-enable LLDP, uncomment below and use Docker host networking mode
+        /*
         const lldpActive = this.activeProtocol === 'lldp' ? 'active' : '';
         html += `
             <button class="protocol-tab lldp ${lldpActive}" data-protocol="lldp">
@@ -426,6 +442,7 @@ class AgentDashboard {
                 LLDP
             </button>
         `;
+        */
 
         for (const [proto, data] of Object.entries(this.protocols)) {
             const active = proto === this.activeProtocol ? 'active' : '';
@@ -450,9 +467,10 @@ class AgentDashboard {
             `;
         }
 
-        // Optional MCP tabs - shown only when enabled
+        // Optional MCP tabs - shown only when enabled AND configured
         // Email tab (SMTP MCP)
-        if (this.enabledMcps.has('smtp')) {
+        const smtpMcp = this.mcpStatus?.optional?.mcps?.find(m => m.type === 'smtp');
+        if (smtpMcp && smtpMcp.enabled && smtpMcp.has_config) {
             const emailActive = this.activeProtocol === 'email' ? 'active' : '';
             html += `
                 <button class="protocol-tab email ${emailActive}" data-protocol="email">
@@ -462,14 +480,18 @@ class AgentDashboard {
             `;
         }
 
-        // NetBox tab - always show (core DCIM/IPAM integration feature)
-        const netboxActive = this.activeProtocol === 'netbox' ? 'active' : '';
-        html += `
-            <button class="protocol-tab netbox ${netboxActive}" data-protocol="netbox">
-                <span class="protocol-indicator active"></span>
-                📦 NetBox
-            </button>
-        `;
+        // NetBox tab - shown only when NetBox MCP is enabled AND configured
+        // Check both that it's enabled and that it has actual configuration (URL/token)
+        const netboxMcp = this.mcpStatus?.optional?.mcps?.find(m => m.type === 'netbox');
+        if (netboxMcp && netboxMcp.enabled && netboxMcp.has_config) {
+            const netboxActive = this.activeProtocol === 'netbox' ? 'active' : '';
+            html += `
+                <button class="protocol-tab netbox ${netboxActive}" data-protocol="netbox">
+                    <span class="protocol-indicator active"></span>
+                    📦 NetBox
+                </button>
+            `;
+        }
 
         tabsContainer.innerHTML = html;
 
@@ -2501,6 +2523,25 @@ class AgentDashboard {
         };
     }
 
+    async fetchGREData() {
+        try {
+            const response = await fetch('/api/gre/tunnels');
+            if (response.ok) {
+                const data = await response.json();
+                if (data.tunnels && data.tunnels.length > 0) {
+                    this.protocols.gre = {
+                        enabled: true,
+                        tunnel_count: data.count,
+                        tunnels: data.tunnels
+                    };
+                    this.updateGREData(this.protocols.gre);
+                }
+            }
+        } catch (e) {
+            console.log('Could not fetch GRE data:', e);
+        }
+    }
+
     updateGREData(gre) {
         if (!gre) return;
 
@@ -2681,8 +2722,8 @@ class AgentDashboard {
         // Grafana tab event listeners
         this.setupGrafanaEvents();
 
-        // LLDP tab event listeners
-        this.setupLLDPEvents();
+        // LLDP tab disabled - see tab rendering section for details
+        // this.setupLLDPEvents();
 
         // LACP tab event listeners
         this.setupLACPEvents();
@@ -2772,18 +2813,56 @@ class AgentDashboard {
             selectAllBtn.addEventListener('click', () => this.toggleAllTests());
         }
 
-        // Update selected count when checkboxes change
-        const testCheckboxes = document.querySelectorAll('#test-suites-list input[type="checkbox"]');
-        testCheckboxes.forEach(cb => {
-            cb.addEventListener('change', () => this.updateSelectedCount());
-        });
+        // Dynamically load test suites based on agent's actual config
+        this.loadTestSuites();
 
-        // Check pyATS MCP status and update count on load
+        // Check pyATS MCP status
         this.checkPyATSMCPStatus();
-        this.updateSelectedCount();
 
         // Fetch previous test results on page load for persistence
         this.fetchPreviousTestResults();
+    }
+
+    async loadTestSuites() {
+        const container = document.getElementById('test-suites-list');
+        if (!container) return;
+
+        try {
+            const response = await fetch('/api/pyats/test-types');
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json();
+            const testTypes = data.test_types || [];
+
+            if (testTypes.length === 0) {
+                container.innerHTML = '<div class="empty-state" style="padding: 10px;">No test suites available for this agent configuration.</div>';
+                return;
+            }
+
+            let html = '';
+            for (const tt of testTypes) {
+                const checked = tt.default ? 'checked' : '';
+                html += `
+                    <div class="test-suite-item">
+                        <label class="test-suite-checkbox">
+                            <input type="checkbox" ${checked} data-pyats-type="${tt.id}">
+                            ${tt.name}
+                        </label>
+                        <span class="test-count">${tt.description}</span>
+                    </div>
+                `;
+            }
+            container.innerHTML = html;
+
+            // Attach change listeners for count update
+            container.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                cb.addEventListener('change', () => this.updateSelectedCount());
+            });
+            this.updateSelectedCount();
+
+        } catch (error) {
+            console.error('Failed to load test suites:', error);
+            container.innerHTML = '<div class="empty-state" style="padding: 10px; color: var(--text-secondary);">Failed to load test suites. Retry by refreshing.</div>';
+        }
     }
 
     updateSelectedCount() {
@@ -3321,6 +3400,12 @@ class AgentDashboard {
 
         // Store results for filtering
         this.testResults = results;
+
+        // Show "Discuss Results" button after tests complete
+        const discussBtn = document.getElementById('pyats-discuss-btn');
+        if (discussBtn && results.length > 0) {
+            discussBtn.style.display = 'inline-flex';
+        }
     }
 
     filterTestResults(filter) {
@@ -5035,7 +5120,7 @@ class AgentDashboard {
     }
 
     initGrafanaCharts() {
-        // State gauge chart
+        // State gauge chart - starts empty, updated from real status
         const stateCtx = document.getElementById('grafana-state-gauge');
         if (stateCtx) {
             this.grafanaStateChart = new Chart(stateCtx, {
@@ -5043,7 +5128,7 @@ class AgentDashboard {
                 data: {
                     labels: ['Healthy', 'Warning', 'Critical'],
                     datasets: [{
-                        data: [85, 10, 5],
+                        data: [0, 0, 0],
                         backgroundColor: ['#4ade80', '#fbbf24', '#ef4444'],
                         borderWidth: 0
                     }]
@@ -5059,7 +5144,7 @@ class AgentDashboard {
             });
         }
 
-        // Neighbor sparkline
+        // Neighbor sparkline - starts at 0, filled from real data
         const neighborCtx = document.getElementById('grafana-neighbor-sparkline');
         if (neighborCtx) {
             this.grafanaNeighborChart = new Chart(neighborCtx, {
@@ -5067,7 +5152,7 @@ class AgentDashboard {
                 data: {
                     labels: Array(10).fill(''),
                     datasets: [{
-                        data: [2, 2, 3, 3, 3, 2, 2, 3, 3, 3],
+                        data: Array(10).fill(0),
                         borderColor: '#f97316',
                         backgroundColor: 'rgba(249, 115, 22, 0.1)',
                         fill: true,
@@ -5079,12 +5164,12 @@ class AgentDashboard {
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: { legend: { display: false } },
-                    scales: { x: { display: false }, y: { display: false } }
+                    scales: { x: { display: false }, y: { display: false, beginAtZero: true } }
                 }
             });
         }
 
-        // Routes sparkline
+        // Routes sparkline - starts at 0, filled from real data
         const routesCtx = document.getElementById('grafana-routes-sparkline');
         if (routesCtx) {
             this.grafanaRoutesChart = new Chart(routesCtx, {
@@ -5092,7 +5177,7 @@ class AgentDashboard {
                 data: {
                     labels: Array(10).fill(''),
                     datasets: [{
-                        data: [10, 12, 15, 14, 16, 18, 17, 19, 20, 21],
+                        data: Array(10).fill(0),
                         borderColor: '#4ade80',
                         backgroundColor: 'rgba(74, 222, 128, 0.1)',
                         fill: true,
@@ -5104,12 +5189,12 @@ class AgentDashboard {
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: { legend: { display: false } },
-                    scales: { x: { display: false }, y: { display: false } }
+                    scales: { x: { display: false }, y: { display: false, beginAtZero: true } }
                 }
             });
         }
 
-        // LSA chart
+        // LSA chart - starts at 0, updated from real LSDB data
         const lsaCtx = document.getElementById('grafana-lsa-chart');
         if (lsaCtx) {
             this.grafanaLsaChart = new Chart(lsaCtx, {
@@ -5117,7 +5202,7 @@ class AgentDashboard {
                 data: {
                     labels: ['Router', 'Network', 'Summary', 'External'],
                     datasets: [{
-                        data: [5, 3, 8, 12],
+                        data: [0, 0, 0, 0],
                         backgroundColor: ['#f97316', '#22d3ee', '#a855f7', '#4ade80']
                     }]
                 },
@@ -5130,7 +5215,7 @@ class AgentDashboard {
             });
         }
 
-        // Interface utilization
+        // Interface utilization - starts at 0
         const ifUtilCtx = document.getElementById('grafana-interface-util');
         if (ifUtilCtx) {
             this.grafanaIfUtilChart = new Chart(ifUtilCtx, {
@@ -5138,32 +5223,8 @@ class AgentDashboard {
                 data: {
                     labels: Array(20).fill(''),
                     datasets: [
-                        { label: 'eth0', data: Array(20).fill(0).map(() => Math.random() * 50), borderColor: '#22d3ee', tension: 0.4 },
-                        { label: 'eth1', data: Array(20).fill(0).map(() => Math.random() * 30), borderColor: '#f97316', tension: 0.4 }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: { legend: { position: 'top', labels: { boxWidth: 10, font: { size: 10 } } } },
-                    scales: {
-                        x: { display: false },
-                        y: { beginAtZero: true, max: 100, grid: { color: 'rgba(255,255,255,0.1)' } }
-                    }
-                }
-            });
-        }
-
-        // Packet rate
-        const pktRateCtx = document.getElementById('grafana-packet-rate');
-        if (pktRateCtx) {
-            this.grafanaPktRateChart = new Chart(pktRateCtx, {
-                type: 'line',
-                data: {
-                    labels: Array(20).fill(''),
-                    datasets: [
-                        { label: 'RX pps', data: Array(20).fill(0).map(() => Math.random() * 1000), borderColor: '#4ade80', tension: 0.4 },
-                        { label: 'TX pps', data: Array(20).fill(0).map(() => Math.random() * 800), borderColor: '#a855f7', tension: 0.4 }
+                        { label: 'RX bytes', data: Array(20).fill(0), borderColor: '#22d3ee', tension: 0.4 },
+                        { label: 'TX bytes', data: Array(20).fill(0), borderColor: '#f97316', tension: 0.4 }
                     ]
                 },
                 options: {
@@ -5177,48 +5238,110 @@ class AgentDashboard {
                 }
             });
         }
+
+        // Packet rate - starts at 0
+        const pktRateCtx = document.getElementById('grafana-packet-rate');
+        if (pktRateCtx) {
+            this.grafanaPktRateChart = new Chart(pktRateCtx, {
+                type: 'line',
+                data: {
+                    labels: Array(20).fill(''),
+                    datasets: [
+                        { label: 'OSPF msgs', data: Array(20).fill(0), borderColor: '#4ade80', tension: 0.4 },
+                        { label: 'Protocol msgs', data: Array(20).fill(0), borderColor: '#a855f7', tension: 0.4 }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { position: 'top', labels: { boxWidth: 10, font: { size: 10 } } } },
+                    scales: {
+                        x: { display: false },
+                        y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.1)' } }
+                    }
+                }
+            });
+        }
+
+        // Immediately fetch real data to populate charts
+        this.updateGrafanaCharts();
     }
 
     async updateGrafanaCharts() {
         try {
-            const response = await fetch(`/api/agent/${this.agentId}/status`);
-            if (response.ok) {
-                const data = await response.json();
+            // Fetch real metrics from the agent
+            const response = await fetch(`/api/agent/${this.agentId}/metrics`);
+            if (!response.ok) return;
+            const data = await response.json();
 
-                // Update dashboard stats
-                document.getElementById('grafana-last-refresh').textContent = new Date().toLocaleTimeString();
+            // Update last refresh timestamp
+            const refreshEl = document.getElementById('grafana-last-refresh');
+            if (refreshEl) refreshEl.textContent = new Date().toLocaleTimeString();
 
-                // Add new data points to charts
-                if (this.grafanaNeighborChart) {
-                    const neighborData = this.grafanaNeighborChart.data.datasets[0].data;
-                    neighborData.push(data.neighbor_count || neighborData[neighborData.length - 1] || 0);
-                    if (neighborData.length > 20) neighborData.shift();
-                    this.grafanaNeighborChart.update('none');
+            // State gauge - calculate from real health data
+            if (this.grafanaStateChart) {
+                const ospfActive = data.ospf && data.ospf.active;
+                const bgpActive = data.bgp && data.bgp.active;
+                const neighborCount = data.neighbor_count || 0;
+                // Simple health: healthy if protocols active and neighbors present
+                let healthy = 0, warning = 0, critical = 0;
+                if (ospfActive || bgpActive) {
+                    healthy = neighborCount > 0 ? 100 : 0;
+                    warning = neighborCount === 0 ? 100 : 0;
+                } else {
+                    critical = 100;
                 }
+                this.grafanaStateChart.data.datasets[0].data = [healthy, warning, critical];
+                this.grafanaStateChart.update('none');
+            }
 
-                if (this.grafanaRoutesChart) {
-                    const routeData = this.grafanaRoutesChart.data.datasets[0].data;
-                    routeData.push(data.route_count || routeData[routeData.length - 1] || 0);
-                    if (routeData.length > 20) routeData.shift();
-                    this.grafanaRoutesChart.update('none');
-                }
+            // Neighbor sparkline - push real neighbor count
+            if (this.grafanaNeighborChart) {
+                const nd = this.grafanaNeighborChart.data.datasets[0].data;
+                nd.push(data.neighbor_count || 0);
+                if (nd.length > 20) nd.shift();
+                this.grafanaNeighborChart.update('none');
+            }
 
-                // Update utilization with random simulation (replace with real data)
-                if (this.grafanaIfUtilChart) {
-                    this.grafanaIfUtilChart.data.datasets.forEach(ds => {
-                        ds.data.push(Math.random() * 50 + 10);
-                        if (ds.data.length > 20) ds.data.shift();
-                    });
-                    this.grafanaIfUtilChart.update('none');
-                }
+            // Routes sparkline - push real route count
+            if (this.grafanaRoutesChart) {
+                const rd = this.grafanaRoutesChart.data.datasets[0].data;
+                rd.push(data.route_count || 0);
+                if (rd.length > 20) rd.shift();
+                this.grafanaRoutesChart.update('none');
+            }
 
-                if (this.grafanaPktRateChart) {
-                    this.grafanaPktRateChart.data.datasets.forEach(ds => {
-                        ds.data.push(Math.random() * 1000);
-                        if (ds.data.length > 20) ds.data.shift();
-                    });
-                    this.grafanaPktRateChart.update('none');
-                }
+            // LSA chart - use real LSDB size (approximate breakdown)
+            if (this.grafanaLsaChart) {
+                const totalLsa = data.lsa_count || 0;
+                // Approximate breakdown: most LSAs are Router LSAs in a simple topology
+                const routerLsa = Math.max(totalLsa, 0);
+                this.grafanaLsaChart.data.datasets[0].data = [routerLsa, 0, 0, 0];
+                this.grafanaLsaChart.update('none');
+            }
+
+            // Interface utilization - use real RX/TX bytes
+            if (this.grafanaIfUtilChart) {
+                const rxDs = this.grafanaIfUtilChart.data.datasets[0];
+                const txDs = this.grafanaIfUtilChart.data.datasets[1];
+                rxDs.data.push(data.rx_bytes || 0);
+                txDs.data.push(data.tx_bytes || 0);
+                if (rxDs.data.length > 20) rxDs.data.shift();
+                if (txDs.data.length > 20) txDs.data.shift();
+                this.grafanaIfUtilChart.update('none');
+            }
+
+            // Protocol message rate - use real OSPF/BGP message counts
+            if (this.grafanaPktRateChart) {
+                const ospfMsgs = data.ospf ? (data.ospf.hello_sent + data.ospf.hello_recv + data.ospf.dbd_sent + data.ospf.dbd_recv) : 0;
+                const bgpMsgs = data.bgp ? (data.bgp.update_sent + data.bgp.update_recv + data.bgp.keepalive_sent + data.bgp.keepalive_recv) : 0;
+                const ospfDs = this.grafanaPktRateChart.data.datasets[0];
+                const bgpDs = this.grafanaPktRateChart.data.datasets[1];
+                ospfDs.data.push(ospfMsgs);
+                bgpDs.data.push(bgpMsgs);
+                if (ospfDs.data.length > 20) ospfDs.data.shift();
+                if (bgpDs.data.length > 20) bgpDs.data.shift();
+                this.grafanaPktRateChart.update('none');
             }
         } catch (error) {
             console.error('Failed to update Grafana charts:', error);
@@ -21098,6 +21221,563 @@ Uptime: ${Math.floor((stats.uptime_seconds || 0) / 60)} minutes
 
     refreshLLMData() {
         this.fetchLLMData();
+    }
+
+    // ==================== CONVERSATION STARTERS ====================
+
+    /**
+     * Start a conversation with tab-specific context
+     * @param {string} contextType - Type of context (ospf-neighbors, bgp-peers, etc.)
+     * @param {object} data - Optional specific data to include
+     */
+    startConversation(contextType, data = null) {
+        // Format context based on type
+        const context = this.formatConversationContext(contextType, data);
+
+        if (!context) {
+            console.error('Failed to generate context for:', contextType);
+            return;
+        }
+
+        // Switch to chat tab
+        this.switchTab('chat');
+
+        // Set the chat input with the context
+        const chatInput = document.getElementById('chat-input');
+        if (chatInput) {
+            chatInput.value = context.prompt;
+            chatInput.focus();
+
+            // Auto-send if configured
+            setTimeout(() => {
+                const sendBtn = document.getElementById('chat-send-btn');
+                if (sendBtn) sendBtn.click();
+            }, 100);
+        }
+
+        console.log('Started conversation with context:', contextType);
+    }
+
+    /**
+     * Format conversation context based on type
+     */
+    formatConversationContext(contextType, customData) {
+        const contexts = {
+            'ospf-neighbors': () => {
+                const neighbors = this.protocols.ospf?.neighbors || [];
+                const neighborCount = neighbors.length;
+                const fullCount = neighbors.filter(n => n.state === 'FULL').length;
+
+                let prompt = `I see ${neighborCount} OSPF neighbor${neighborCount !== 1 ? 's' : ''}`;
+                if (neighborCount > 0) {
+                    prompt += `, ${fullCount} in FULL state. `;
+                    prompt += `Can you explain their status and any issues?\n\nNeighbors:\n`;
+                    neighbors.forEach(n => {
+                        prompt += `- ${n.neighbor_id} (${n.ip_address}): ${n.state}\n`;
+                    });
+                }
+                return { prompt };
+            },
+
+            'ospf-routes': () => {
+                const routes = this.protocols.ospf?.routes || [];
+                const routeCount = routes.length;
+
+                let prompt = `I have ${routeCount} OSPF route${routeCount !== 1 ? 's' : ''}. `;
+                prompt += `Can you explain the routing table and verify everything looks correct?\n\nRoutes:\n`;
+                routes.slice(0, 10).forEach(r => {
+                    prompt += `- ${r.prefix} via ${r.next_hop} (cost: ${r.cost})\n`;
+                });
+                if (routes.length > 10) {
+                    prompt += `... and ${routes.length - 10} more routes\n`;
+                }
+                return { prompt };
+            },
+
+            'interfaces': () => {
+                const interfaces = this.interfaces || [];
+                const upCount = interfaces.filter(i => i.state === 'up').length;
+                const downCount = interfaces.filter(i => i.state === 'down').length;
+
+                let prompt = `I have ${interfaces.length} interfaces: ${upCount} up, ${downCount} down. `;
+                prompt += `Can you analyze the interface status and explain any issues?\n\nInterfaces:\n`;
+                interfaces.forEach(iface => {
+                    prompt += `- ${iface.name} (${iface.type}): ${iface.state} - ${iface.addresses?.join(', ') || 'no IP'}\n`;
+                });
+                return { prompt };
+            },
+
+            'bgp-peers': () => {
+                const peers = this.protocols.bgp?.peers || [];
+                const established = peers.filter(p => p.state === 'Established').length;
+
+                let prompt = `I have ${peers.length} BGP peer${peers.length !== 1 ? 's' : ''}, `;
+                prompt += `${established} established. Can you explain the peering status?\n\nPeers:\n`;
+                peers.forEach(p => {
+                    prompt += `- ${p.peer_ip} (AS${p.remote_as}): ${p.state}\n`;
+                });
+                return { prompt };
+            },
+
+            'bgp-routes': () => {
+                const routes = this.protocols.bgp?.routes || [];
+
+                let prompt = `I have ${routes.length} BGP route${routes.length !== 1 ? 's' : ''} in the Loc-RIB. `;
+                prompt += `Can you analyze the routing table?\n\nRoutes:\n`;
+                routes.slice(0, 10).forEach(r => {
+                    prompt += `- ${r.prefix} via ${r.next_hop} (AS path: ${r.as_path || 'local'})\n`;
+                });
+                if (routes.length > 10) {
+                    prompt += `... and ${routes.length - 10} more routes\n`;
+                }
+                return { prompt };
+            },
+
+            'gre-tunnels': () => {
+                const gre = this.protocols.gre || {};
+                const tunnels = gre.tunnels || [];
+
+                let prompt = `I have ${tunnels.length} GRE tunnel${tunnels.length !== 1 ? 's' : ''}. `;
+                prompt += `Can you test connectivity and explain the tunnel configuration?\n\nTunnels:\n`;
+                tunnels.forEach(t => {
+                    prompt += `- ${t.name}: ${t.local_ip} → ${t.remote_ip} (tunnel IP: ${t.tunnel_ip}, state: ${t.state})\n`;
+                });
+                prompt += `\nPlease:\n1. Verify tunnel connectivity\n2. Check MTU and packet statistics\n3. Explain any issues\n`;
+                return { prompt };
+            },
+
+            'pyats-results': () => {
+                const results = customData || this.getTestResults();
+                const passed = results.filter(r => r.status === 'passed').length;
+                const failed = results.filter(r => r.status === 'failed').length;
+
+                let prompt = `pyATS test results: ${passed} passed, ${failed} failed. `;
+                if (failed > 0) {
+                    prompt += `Can you analyze the failures and suggest fixes?\n\nFailed tests:\n`;
+                    results.filter(r => r.status === 'failed').forEach(t => {
+                        prompt += `- ${t.test}: ${t.error || 'Failed'}\n`;
+                    });
+                } else {
+                    prompt += `All tests passed! Can you summarize what was verified?\n`;
+                }
+                return { prompt };
+            },
+
+            'gait-resume': () => {
+                const commitId = customData?.commitId;
+                if (!commitId) return null;
+
+                let prompt = `Resume conversation from commit ${commitId}. `;
+                prompt += `Please restore the context and continue where we left off.`;
+                return { prompt, action: 'resume', commitId };
+            },
+
+            'ospfv3-neighbors': () => {
+                const neighbors = this.protocols.ospfv3?.neighbors || [];
+                const fullCount = neighbors.filter(n => n.state === 'FULL').length;
+
+                let prompt = `I have ${neighbors.length} OSPFv3 (IPv6) neighbor${neighbors.length !== 1 ? 's' : ''}, `;
+                prompt += `${fullCount} in FULL state. Can you explain their IPv6 status?\n\nNeighbors:\n`;
+                neighbors.forEach(n => {
+                    prompt += `- ${n.neighbor_id} (${n.ipv6_address}): ${n.state}\n`;
+                });
+                return { prompt };
+            },
+
+            'bgp-ipv6-peers': () => {
+                const peers = this.protocols.bgp?.ipv6_peers || [];
+                const established = peers.filter(p => p.state === 'Established').length;
+
+                let prompt = `I have ${peers.length} BGP IPv6 peer${peers.length !== 1 ? 's' : ''}, `;
+                prompt += `${established} established. Can you explain the IPv6 peering?\n\nPeers:\n`;
+                peers.forEach(p => {
+                    prompt += `- ${p.peer_ipv6} (AS${p.remote_as}): ${p.state}\n`;
+                });
+                return { prompt };
+            },
+
+            'bgp-ipv6-routes': () => {
+                const routes = this.protocols.bgp?.ipv6_routes || [];
+
+                let prompt = `I have ${routes.length} BGP IPv6 route${routes.length !== 1 ? 's' : ''} in the Loc-RIB. `;
+                prompt += `Can you analyze the IPv6 routing table?\n\nRoutes:\n`;
+                routes.slice(0, 10).forEach(r => {
+                    prompt += `- ${r.prefix} via ${r.next_hop}\n`;
+                });
+                if (routes.length > 10) {
+                    prompt += `... and ${routes.length - 10} more routes\n`;
+                }
+                return { prompt };
+            },
+
+            'isis-adjacencies': () => {
+                const adjacencies = this.protocols.isis?.adjacencies || [];
+                const upCount = adjacencies.filter(a => a.state === 'Up').length;
+
+                let prompt = `I have ${adjacencies.length} IS-IS adjacenc${adjacencies.length !== 1 ? 'ies' : 'y'}, `;
+                prompt += `${upCount} up. Can you explain the IS-IS topology?\n\nAdjacencies:\n`;
+                adjacencies.forEach(a => {
+                    prompt += `- ${a.system_id} (${a.interface}): ${a.state}, Level ${a.level}\n`;
+                });
+                return { prompt };
+            },
+
+            'bfd-sessions': () => {
+                const sessions = this.protocols.bfd?.sessions || [];
+                const upCount = sessions.filter(s => s.state === 'Up').length;
+
+                let prompt = `I have ${sessions.length} BFD session${sessions.length !== 1 ? 's' : ''}, `;
+                prompt += `${upCount} up. Can you explain the fast failure detection status?\n\nSessions:\n`;
+                sessions.forEach(s => {
+                    prompt += `- ${s.peer_address}: ${s.state}, detection time ${s.detection_time}ms\n`;
+                });
+                return { prompt };
+            },
+
+            'evpn-routes': () => {
+                const routes = this.protocols.evpn?.routes || [];
+
+                let prompt = `I have ${routes.length} EVPN route${routes.length !== 1 ? 's' : ''}. `;
+                prompt += `Can you explain the VXLAN overlay network?\n\nRoutes:\n`;
+                routes.slice(0, 10).forEach(r => {
+                    prompt += `- Type ${r.type}: ${r.rd} (${r.mac_ip})\n`;
+                });
+                if (routes.length > 10) {
+                    prompt += `... and ${routes.length - 10} more routes\n`;
+                }
+                return { prompt };
+            },
+
+            'lldp-neighbors': () => {
+                const neighbors = this.protocols.lldp?.neighbors || [];
+
+                let prompt = `I discovered ${neighbors.length} LLDP neighbor${neighbors.length !== 1 ? 's' : ''}. `;
+                prompt += `Can you explain the Layer 2 topology?\n\nNeighbors:\n`;
+                neighbors.forEach(n => {
+                    prompt += `- ${n.system_name || n.chassis_id} on ${n.local_interface} → ${n.port_description}\n`;
+                });
+                return { prompt };
+            },
+
+            'markmap': () => {
+                let prompt = `Can you explain my current network topology and agent state? `;
+                prompt += `Please analyze:\n`;
+                prompt += `- Routing protocols and their status\n`;
+                prompt += `- Interface configuration\n`;
+                prompt += `- Neighbor relationships\n`;
+                prompt += `- Any potential issues or optimization opportunities\n`;
+                return { prompt };
+            },
+
+            'prometheus': () => {
+                let prompt = `Can you analyze my Prometheus metrics and explain:\n`;
+                prompt += `1. Current performance metrics\n`;
+                prompt += `2. Any unusual patterns or anomalies\n`;
+                prompt += `3. Recommendations for monitoring and alerting\n`;
+                return { prompt };
+            },
+
+            'qos': () => {
+                let prompt = `I'm running RFC 4594 DiffServ QoS. Can you:\n`;
+                prompt += `1. Explain my current QoS configuration\n`;
+                prompt += `2. Verify traffic classification is working\n`;
+                prompt += `3. Recommend any optimizations for traffic types\n`;
+                return { prompt };
+            },
+
+            'netflow': () => {
+                let prompt = `I'm collecting IPFIX/NetFlow data. Can you:\n`;
+                prompt += `1. Analyze my current flow patterns\n`;
+                prompt += `2. Identify top talkers and traffic types\n`;
+                prompt += `3. Detect any unusual traffic or security concerns\n`;
+                return { prompt };
+            },
+
+            'programmability': () => {
+                let prompt = `Can you help me integrate with this agent programmatically?\n\n`;
+                prompt += `I'm interested in:\n`;
+                prompt += `1. REST API endpoints and authentication\n`;
+                prompt += `2. Available MCP servers and their capabilities\n`;
+                prompt += `3. Example code for common automation tasks\n`;
+                prompt += `4. Best practices for monitoring and alerting\n\n`;
+                prompt += `What protocols are running: ${Object.keys(this.protocols).join(', ')}`;
+                return { prompt };
+            }
+        };
+
+        const formatter = contexts[contextType];
+        if (!formatter) {
+            console.warn('Unknown context type:', contextType);
+            return null;
+        }
+
+        return formatter();
+    }
+
+    /**
+     * Get current test results for pyATS
+     */
+    getTestResults() {
+        const table = document.getElementById('test-results-table');
+        if (!table) return [];
+
+        const results = [];
+        const rows = table.querySelectorAll('tr');
+        rows.forEach(row => {
+            const cells = row.querySelectorAll('td');
+            if (cells.length >= 3) {
+                results.push({
+                    test: cells[0].textContent.trim(),
+                    suite: cells[1].textContent.trim(),
+                    status: cells[2].textContent.trim().toLowerCase(),
+                    error: cells[3]?.textContent.trim()
+                });
+            }
+        });
+        return results;
+    }
+
+    /**
+     * Resume GAIT conversation from commit ID
+     */
+    resumeConversation(commitId) {
+        this.startConversation('gait-resume', { commitId });
+    }
+
+    // ==================== PROGRAMMABILITY TAB METHODS ====================
+
+    /**
+     * Switch between OpenAPI and MCP subtabs
+     */
+    switchProgrammabilityTab(subtab) {
+        // Update subtab buttons
+        document.querySelectorAll('.programmability-subtab').forEach(btn => {
+            btn.classList.remove('active');
+            btn.style.borderBottom = '2px solid transparent';
+            btn.style.color = 'var(--text-secondary)';
+        });
+
+        const activeBtn = document.querySelector(`[data-subtab="${subtab}"]`);
+        if (activeBtn) {
+            activeBtn.classList.add('active');
+            activeBtn.style.borderBottom = '2px solid var(--accent-cyan)';
+            activeBtn.style.color = 'var(--accent-cyan)';
+        }
+
+        // Show/hide content
+        document.querySelectorAll('.programmability-subtab-content').forEach(content => {
+            content.style.display = 'none';
+        });
+
+        const content = document.getElementById(`${subtab}-subtab-content`);
+        if (content) {
+            content.style.display = 'block';
+        }
+
+        // Load content if needed
+        if (subtab === 'openapi') {
+            this.loadSwaggerUI();
+        } else if (subtab === 'mcp') {
+            this.loadMCPServers();
+        }
+    }
+
+    /**
+     * Load Swagger UI with OpenAPI spec
+     */
+    async loadSwaggerUI() {
+        // Check if Swagger UI is already loaded
+        if (document.getElementById('swagger-ui').innerHTML) {
+            return; // Already loaded
+        }
+
+        try {
+            // Load Swagger UI library
+            if (!window.SwaggerUIBundle) {
+                const link = document.createElement('link');
+                link.rel = 'stylesheet';
+                link.href = 'https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css';
+                document.head.appendChild(link);
+
+                const script = document.createElement('script');
+                script.src = 'https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js';
+                script.onload = () => this.initSwaggerUI();
+                document.head.appendChild(script);
+            } else {
+                this.initSwaggerUI();
+            }
+        } catch (error) {
+            console.error('Failed to load Swagger UI:', error);
+            document.getElementById('swagger-ui').innerHTML = `
+                <div style="padding: 20px; color: var(--accent-red);">
+                    Failed to load Swagger UI. Please refresh the page.
+                </div>
+            `;
+        }
+    }
+
+    /**
+     * Initialize Swagger UI with agent's OpenAPI spec
+     */
+    async initSwaggerUI() {
+        try {
+            // Fetch OpenAPI spec from agent
+            const response = await fetch(`/api/openapi.json?agent_id=${this.agentId}`);
+            const spec = await response.json();
+
+            // Initialize Swagger UI
+            window.SwaggerUIBundle({
+                spec: spec,
+                dom_id: '#swagger-ui',
+                deepLinking: true,
+                presets: [
+                    window.SwaggerUIBundle.presets.apis,
+                    window.SwaggerUIBundle.SwaggerUIStandalonePreset
+                ],
+                layout: "BaseLayout",
+                defaultModelsExpandDepth: 1,
+                defaultModelExpandDepth: 1
+            });
+
+            // Update API base URL
+            const baseUrl = spec.servers?.[0]?.url || `http://localhost:${this.apiPort || 8888}`;
+            document.getElementById('api-base-url').textContent = baseUrl;
+        } catch (error) {
+            console.error('Failed to load OpenAPI spec:', error);
+            document.getElementById('swagger-ui').innerHTML = `
+                <div style="padding: 20px; color: var(--accent-red);">
+                    Failed to load OpenAPI specification. The agent may not have API documentation available.
+                </div>
+            `;
+        }
+    }
+
+    /**
+     * Load MCP servers information
+     */
+    async loadMCPServers() {
+        try {
+            const response = await fetch(`/api/mcp/servers?agent_id=${this.agentId}`);
+            const data = await response.json();
+
+            const serversList = document.getElementById('mcp-servers-list');
+            if (!data.servers || data.servers.length === 0) {
+                serversList.innerHTML = `
+                    <div style="color: var(--text-secondary); padding: 20px; text-align: center;">
+                        No MCP servers are currently enabled on this agent.
+                    </div>
+                `;
+                return;
+            }
+
+            let html = '';
+            for (const server of data.servers) {
+                const statusColor = server.enabled ? 'var(--accent-green)' : 'var(--text-secondary)';
+                html += `
+                    <div style="background: var(--bg-secondary); padding: 15px; border-radius: 8px; margin-bottom: 15px; border-left: 3px solid ${statusColor};">
+                        <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 10px;">
+                            <div>
+                                <h5 style="margin: 0; color: ${statusColor};">${server.name}</h5>
+                                <p style="color: var(--text-secondary); font-size: 0.85rem; margin: 5px 0 0 0;">${server.description}</p>
+                            </div>
+                            <span class="status-badge ${server.enabled ? 'active' : 'down'}">${server.enabled ? 'Enabled' : 'Disabled'}</span>
+                        </div>
+                        <div style="margin-top: 10px;">
+                            <strong style="color: var(--text-secondary); font-size: 0.85rem;">Tools:</strong>
+                            <div style="display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px;">
+                                ${server.tools.map(tool => `
+                                    <span style="background: var(--bg-tertiary); padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; color: var(--text-primary);" title="${tool.description || ''}">
+                                        ${tool.name || tool}
+                                    </span>
+                                `).join('')}
+                            </div>
+                        </div>
+                        ${server.url ? `
+                            <div style="margin-top: 10px;">
+                                <strong style="color: var(--text-secondary); font-size: 0.85rem;">Endpoint:</strong>
+                                <code style="color: var(--accent-cyan); margin-left: 5px; font-size: 0.85rem;">${server.url}</code>
+                            </div>
+                        ` : ''}
+                    </div>
+                `;
+            }
+
+            serversList.innerHTML = html;
+
+            // Update Claude Desktop config with actual container name
+            const containerName = data.container_name || 'CONTAINER_NAME';
+            const configElement = document.getElementById('claude-desktop-config');
+            if (configElement) {
+                configElement.textContent = JSON.stringify({
+                    mcpServers: {
+                        "agent-network": {
+                            command: "docker",
+                            args: ["exec", "-i", containerName, "python3", "-m", "agentic.mcp.server"]
+                        }
+                    }
+                }, null, 2);
+            }
+        } catch (error) {
+            console.error('Failed to load MCP servers:', error);
+            document.getElementById('mcp-servers-list').innerHTML = `
+                <div style="color: var(--accent-red); padding: 20px; text-align: center;">
+                    Failed to load MCP servers information.
+                </div>
+            `;
+        }
+    }
+
+    /**
+     * Download OpenAPI specification
+     */
+    async downloadOpenAPISpec() {
+        try {
+            const response = await fetch(`/api/openapi.json?agent_id=${this.agentId}`);
+            const spec = await response.json();
+
+            const blob = new Blob([JSON.stringify(spec, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `agent-${this.agentId}-openapi.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (error) {
+            console.error('Failed to download OpenAPI spec:', error);
+            alert('Failed to download OpenAPI specification');
+        }
+    }
+
+    /**
+     * Copy OpenAPI URL to clipboard
+     */
+    async copyOpenAPIURL() {
+        const url = `http://localhost:${this.apiPort || 8888}/api/openapi.json`;
+        try {
+            await navigator.clipboard.writeText(url);
+            alert('OpenAPI URL copied to clipboard!');
+        } catch (error) {
+            console.error('Failed to copy URL:', error);
+            alert('Failed to copy URL to clipboard');
+        }
+    }
+
+    /**
+     * Copy MCP configuration to clipboard
+     */
+    async copyMCPConfig(client) {
+        const configElement = document.getElementById('claude-desktop-config');
+        if (configElement) {
+            try {
+                await navigator.clipboard.writeText(configElement.textContent);
+                alert('MCP configuration copied to clipboard!');
+            } catch (error) {
+                console.error('Failed to copy config:', error);
+                alert('Failed to copy configuration to clipboard');
+            }
+        }
     }
 
     // ==================== UTILITY METHODS ====================

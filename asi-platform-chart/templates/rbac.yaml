@@ -1,0 +1,130 @@
+{{- if .Values.controller.rbac.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "asi-platform.controller.serviceAccountName" . }}
+  namespace: asi-system
+  labels:
+    {{- include "asi-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+  {{- with .Values.controller.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "asi-platform.fullname" . }}-controller
+  labels:
+    {{- include "asi-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+rules:
+# AgentTopology CRs
+- apiGroups: ["asi.asi.anthropic.com"]
+  resources: ["agenttopologies"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["asi.asi.anthropic.com"]
+  resources: ["agenttopologies/status"]
+  verbs: ["get", "update", "patch"]
+- apiGroups: ["asi.asi.anthropic.com"]
+  resources: ["agenttopologies/finalizers"]
+  verbs: ["update"]
+# Namespaces
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# ConfigMaps
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Services
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# StatefulSets
+- apiGroups: ["apps"]
+  resources: ["statefulsets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# NetworkAttachmentDefinitions (Multus CNI)
+- apiGroups: ["k8s.cni.cncf.io"]
+  resources: ["network-attachment-definitions"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Events (for logging)
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "asi-platform.fullname" . }}-controller
+  labels:
+    {{- include "asi-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "asi-platform.fullname" . }}-controller
+subjects:
+- kind: ServiceAccount
+  name: {{ include "asi-platform.controller.serviceAccountName" . }}
+  namespace: asi-system
+{{- end }}
+
+{{- if .Values.wizard.rbac.create }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "asi-platform.wizard.serviceAccountName" . }}
+  namespace: asi-system
+  labels:
+    {{- include "asi-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: wizard
+  {{- with .Values.wizard.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "asi-platform.fullname" . }}-wizard
+  labels:
+    {{- include "asi-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: wizard
+rules:
+# AgentTopology CRs (create, read, delete)
+- apiGroups: ["asi.asi.anthropic.com"]
+  resources: ["agenttopologies"]
+  verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+- apiGroups: ["asi.asi.anthropic.com"]
+  resources: ["agenttopologies/status"]
+  verbs: ["get", "list", "watch"]
+# Namespaces (list only for UI)
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["list", "get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "asi-platform.fullname" . }}-wizard
+  labels:
+    {{- include "asi-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: wizard
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "asi-platform.fullname" . }}-wizard
+subjects:
+- kind: ServiceAccount
+  name: {{ include "asi-platform.wizard.serviceAccountName" . }}
+  namespace: asi-system
+{{- end }}

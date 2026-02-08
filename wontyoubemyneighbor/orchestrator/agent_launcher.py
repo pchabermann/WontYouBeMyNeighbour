@@ -166,8 +166,72 @@ class AgentLauncher:
         for proto in agent.protos:
             if proto.p == "ospf":
                 cmd.extend(["--area", proto.a or "0.0.0.0"])
-                # Interface will be eth0 in container
-                cmd.extend(["--interface", "eth0"])
+
+                # Determine which interfaces should run OSPF
+                ospf_interfaces = []
+
+                # Check if protocol specifies interfaces explicitly
+                if hasattr(proto, 'interfaces') and proto.interfaces:
+                    # Use user-specified interfaces from wizard
+                    # Special handling: rename gre0 to gre1 (gre0 is a special Linux interface)
+                    ospf_interfaces = ["gre1" if iface == "gre0" else iface for iface in proto.interfaces]
+                    if "gre0" in proto.interfaces:
+                        self.logger.info(f"OSPF configured for specific interfaces: {proto.interfaces} (gre0 auto-renamed to gre1)")
+                    else:
+                        self.logger.info(f"OSPF configured for specific interfaces: {ospf_interfaces}")
+                else:
+                    # Legacy/automatic mode: include eth0 and all GRE interfaces
+                    ospf_interfaces = ["eth0"]  # Always include eth0
+
+                    # Check for GRE tunnel interfaces in agent.ifs
+                    for iface in agent.ifs:
+                        if iface.t == "gre":
+                            # Special handling: gre0 is a default Linux interface that can't be deleted
+                            # Automatically rename gre0 to gre1 (must match docker-entrypoint.sh behavior)
+                            iface_name = "gre1" if iface.n == "gre0" else iface.n
+
+                            if iface_name not in ospf_interfaces:
+                                ospf_interfaces.append(iface_name)
+                                # GRE tunnels should use point-to-point network type
+                                if iface.n == "gre0":
+                                    self.logger.info(f"Adding GRE interface {iface.n} to OSPF as gre1 (auto-renamed, auto-detected)")
+                                else:
+                                    self.logger.info(f"Adding GRE interface {iface_name} to OSPF (auto-detected)")
+
+                # Add all interfaces to command
+                for iface_name in ospf_interfaces:
+                    cmd.extend(["--interface", iface_name])
+
+                # Add per-interface unicast peers from interface definitions
+                self.logger.info(f"DEBUG: Checking {len(agent.ifs)} interfaces for unicast peers")
+                for iface in agent.ifs:
+                    iface_name = "gre1" if iface.n == "gre0" else iface.n
+                    self.logger.info(f"DEBUG: Interface {iface_name}, type: {type(iface).__name__}, dir: {dir(iface)}")
+
+                    if iface_name in ospf_interfaces:
+                        # Check if interface has ospf_neighbor defined (try both attribute and dict access)
+                        ospf_neighbor = None
+                        if hasattr(iface, 'ospf_neighbor'):
+                            ospf_neighbor = iface.ospf_neighbor
+                            self.logger.info(f"DEBUG: Found ospf_neighbor via hasattr: {ospf_neighbor}")
+                        elif hasattr(iface, '__dict__') and 'ospf_neighbor' in iface.__dict__:
+                            ospf_neighbor = iface.__dict__['ospf_neighbor']
+                            self.logger.info(f"DEBUG: Found ospf_neighbor via __dict__: {ospf_neighbor}")
+                        elif isinstance(iface, dict) and 'ospf_neighbor' in iface:
+                            ospf_neighbor = iface['ospf_neighbor']
+                            self.logger.info(f"DEBUG: Found ospf_neighbor via dict: {ospf_neighbor}")
+                        else:
+                            self.logger.warning(f"DEBUG: Could not find ospf_neighbor on {iface_name}, checking raw attributes...")
+                            # Try to access all attributes
+                            if hasattr(iface, '__dict__'):
+                                self.logger.warning(f"DEBUG: iface.__dict__ = {iface.__dict__}")
+
+                        if ospf_neighbor:
+                            cmd.extend(["--interface-unicast-peer", f"{iface_name}:{ospf_neighbor}"])
+                            self.logger.info(f"✓ Configured OSPF unicast neighbor for {iface_name}: {ospf_neighbor}")
+                        else:
+                            self.logger.warning(f"✗ No OSPF unicast neighbor found for {iface_name}")
+
                 if proto.opts.get("network_type"):
                     cmd.extend(["--network-type", proto.opts["network_type"]])
                 if proto.opts.get("unicast_peer"):
@@ -218,7 +282,18 @@ class AgentLauncher:
                     cmd.extend(["--isis-level", str(proto.opts["level"])])
                 if proto.opts.get("metric"):
                     cmd.extend(["--isis-metric", str(proto.opts["metric"])])
-                cmd.extend(["--isis-interface", "eth0"])
+
+                # Add IS-IS interfaces
+                isis_interfaces = []
+                if hasattr(proto, 'interfaces') and proto.interfaces:
+                    isis_interfaces = proto.interfaces
+                else:
+                    # Default to eth0 if not specified
+                    isis_interfaces = ["eth0"]
+
+                for iface_name in isis_interfaces:
+                    cmd.extend(["--isis-interface", iface_name])
+
                 # Add networks to advertise
                 for net in proto.nets:
                     cmd.extend(["--isis-network", net])
@@ -227,7 +302,18 @@ class AgentLauncher:
                 # MPLS/LDP configuration
                 if proto.opts.get("router_id") or agent.r:
                     cmd.extend(["--mpls-router-id", proto.opts.get("router_id", agent.r)])
-                cmd.extend(["--ldp-interface", "eth0"])
+
+                # Add LDP interfaces
+                ldp_interfaces = []
+                if hasattr(proto, 'interfaces') and proto.interfaces:
+                    ldp_interfaces = proto.interfaces
+                else:
+                    # Default to eth0 if not specified
+                    ldp_interfaces = ["eth0"]
+
+                for iface_name in ldp_interfaces:
+                    cmd.extend(["--ldp-interface", iface_name])
+
                 # Add LDP neighbors
                 for neighbor in proto.opts.get("neighbors", []):
                     neighbor_ip = neighbor
@@ -439,6 +525,87 @@ class AgentLauncher:
 
         return env
 
+    def _add_gre_environment(self, agent: TOONAgent, environment: Dict[str, str]):
+        """
+        Add GRE tunnel configuration to environment variables
+
+        Args:
+            agent: TOON agent configuration
+            environment: Environment dict to update
+        """
+        print(f"\n========== GRE DEBUG: _add_gre_environment called for agent {agent.id} ==========", flush=True)
+        print(f"GRE DEBUG: Agent has {len(agent.ifs)} interfaces", flush=True)
+        print(f"GRE DEBUG: agent.ifs type: {type(agent.ifs)}", flush=True)
+        print(f"GRE DEBUG: agent.ifs value: {agent.ifs}", flush=True)
+        self.logger.info(f"========== GRE DEBUG: _add_gre_environment called for agent {agent.id} ==========")
+        self.logger.info(f"GRE DEBUG: Agent has {len(agent.ifs)} interfaces")
+
+        tunnel_count = 0
+        try:
+            print(f"GRE DEBUG: About to start for loop over {len(agent.ifs)} interfaces", flush=True)
+            for i, iface in enumerate(agent.ifs):
+                print(f"GRE DEBUG: Loop iteration {i}, interface type: {type(iface)}", flush=True)
+                print(f"GRE DEBUG: Interface {i}: name={iface.n}, type={iface.t}", flush=True)
+                self.logger.info(f"GRE DEBUG: Interface {i}: name={iface.n}, type={iface.t}, has_tun={hasattr(iface, 'tun')}, tun_value={iface.tun if hasattr(iface, 'tun') else 'NO ATTR'}")
+
+                if iface.t == "gre":
+                    print(f"GRE DEBUG: Found GRE interface {iface.n}!", flush=True)
+                    self.logger.info(f"GRE DEBUG: Found GRE interface {iface.n}")
+
+                    if not hasattr(iface, "tun"):
+                        self.logger.error(f"GRE DEBUG: Interface {iface.n} is type 'gre' but has NO 'tun' attribute!")
+                        continue
+
+                    if not iface.tun:
+                        self.logger.error(f"GRE DEBUG: Interface {iface.n} has 'tun' attribute but it's None or empty!")
+                        continue
+
+                    tun_config = iface.tun
+                    print(f"GRE DEBUG: tun_config = {tun_config}", flush=True)
+                    self.logger.info(f"GRE DEBUG: tun_config = {tun_config}")
+
+                    tunnel_name = iface.n
+                    tunnel_ip = iface.a[0] if iface.a else None
+
+                    if not tunnel_ip:
+                        self.logger.warning(f"GRE DEBUG: No IP address defined for GRE tunnel {tunnel_name}")
+                        continue
+
+                    # Format: name:local_ip:remote_ip:tunnel_ip:key:ttl:mtu
+                    local_ip = tun_config.get("src") or tun_config.get("local", "")
+                    remote_ip = tun_config.get("dst") or tun_config.get("remote", "")
+                    key = str(tun_config.get("key", "none"))
+                    ttl = str(tun_config.get("ttl", 255))
+                    mtu = str(iface.mtu if hasattr(iface, "mtu") and iface.mtu else 1400)
+
+                    env_var = f"GRE_TUNNEL_{tunnel_count}"
+                    env_value = f"{tunnel_name}:{local_ip}:{remote_ip}:{tunnel_ip}:{key}:{ttl}:{mtu}"
+                    environment[env_var] = env_value
+
+                    print(f"GRE DEBUG: *** ADDED *** {env_var}={env_value}", flush=True)
+                    self.logger.info(f"GRE DEBUG: *** ADDED *** {env_var}={env_value}")
+                    tunnel_count += 1
+        except Exception as e:
+            print(f"GRE DEBUG: EXCEPTION in for loop: {type(e).__name__}: {e}", flush=True)
+            self.logger.error(f"GRE DEBUG: EXCEPTION in for loop: {e}", exc_info=True)
+            import traceback
+            traceback.print_exc()
+
+        print(f"GRE DEBUG: Total GRE tunnels added: {tunnel_count}", flush=True)
+        print(f"GRE DEBUG: Environment dict now has {len(environment)} keys: {list(environment.keys())}", flush=True)
+        print(f"========== GRE DEBUG: _add_gre_environment completed ==========\n", flush=True)
+        self.logger.info(f"GRE DEBUG: Total GRE tunnels added: {tunnel_count}")
+        self.logger.info(f"GRE DEBUG: Environment dict now has {len(environment)} keys: {list(environment.keys())}")
+        self.logger.info(f"========== GRE DEBUG: _add_gre_environment completed ==========")
+
+
+    def _has_gre_interfaces(self, agent: TOONAgent) -> bool:
+        """Check if agent has any GRE interfaces"""
+        for iface in agent.ifs:
+            if iface.t == "gre":
+                return True
+        return False
+
     async def launch(
         self,
         agent: TOONAgent,
@@ -518,6 +685,9 @@ class AgentLauncher:
                 network_foundation=network_foundation
             )
 
+            # Add GRE tunnel configuration to environment
+            self._add_gre_environment(agent, environment)
+
             # Add container name to environment for dashboard display
             environment["CONTAINER_NAME"] = container_name
 
@@ -541,6 +711,10 @@ class AgentLauncher:
                 ip_address=assigned_ip
             )
 
+            # IMMEDIATELY connect to external networks before entrypoint creates GRE tunnels
+            # The entrypoint waits for these IPs to be configured
+            await self._connect_external_networks(agent, container_name)
+
             agent_container.container_id = container_info.id
             agent_container.ip_address = container_info.ip_address
             agent_container.status = "running"
@@ -557,6 +731,48 @@ class AgentLauncher:
             self.logger.error(f"Failed to launch agent {agent.id}: {e}")
 
         return agent_container
+
+    async def _connect_external_networks(self, agent: TOONAgent, container_name: str):
+        """
+        Connect agent container to external Docker networks
+
+        Args:
+            agent: TOON agent configuration
+            container_name: Name of the created container
+        """
+        for iface in agent.ifs:
+            # Check if interface has description indicating external network
+            # Look for interfaces with underlay network configuration
+            if hasattr(iface, "description") and iface.description:
+                desc = iface.description.lower()
+                if "external" in desc or "underlay" in desc:
+                    # Extract network name from description or use convention
+                    # Convention: external-frr_gre-underlay for GRE underlay networks
+                    if "gre" in desc and "underlay" in desc:
+                        # Try to connect to external-frr_gre-underlay network
+                        external_network = "external-frr_gre-underlay"
+                        ip_address = iface.a[0].split('/')[0] if iface.a else None
+
+                        self.logger.info(
+                            f"Connecting {container_name} to external network {external_network} "
+                            f"with IP {ip_address}"
+                        )
+
+                        success = self.docker.connect_to_external_network(
+                            container_name=container_name,
+                            network_name=external_network,
+                            ipv4_address=ip_address
+                        )
+
+                        if success:
+                            self.logger.info(
+                                f"Successfully connected {container_name} to {external_network}"
+                            )
+                        else:
+                            self.logger.warning(
+                                f"Failed to connect {container_name} to {external_network}. "
+                                "Ensure the network exists (e.g., from external-frr docker-compose)"
+                            )
 
     async def stop(self, agent_id: str, remove: bool = False) -> bool:
         """

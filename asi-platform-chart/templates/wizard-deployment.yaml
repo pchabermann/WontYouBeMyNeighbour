@@ -1,0 +1,91 @@
+{{- if .Values.wizard.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "asi-platform.fullname" . }}-wizard
+  namespace: asi-system
+  labels:
+    {{- include "asi-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: wizard
+spec:
+  replicas: {{ .Values.wizard.replicaCount }}
+  selector:
+    matchLabels:
+      app: asi-wizard
+      {{- include "asi-platform.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        app: asi-wizard
+        {{- include "asi-platform.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "asi-platform.wizard.serviceAccountName" . }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: wizard
+        image: "{{ .Values.global.imageRegistry }}/{{ .Values.wizard.image.repository }}:{{ .Values.wizard.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.wizard.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        resources:
+          {{- toYaml .Values.wizard.resources | nindent 10 }}
+        livenessProbe:
+          httpGet:
+            path: /api/wizard/health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/wizard/health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "asi-platform.fullname" . }}-wizard
+  namespace: asi-system
+  labels:
+    {{- include "asi-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: wizard
+  {{- with .Values.wizard.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.wizard.service.type }}
+  selector:
+    app: asi-wizard
+    {{- include "asi-platform.selectorLabels" . | nindent 4 }}
+  ports:
+  - name: http
+    port: {{ .Values.wizard.service.port }}
+    targetPort: {{ .Values.wizard.service.targetPort }}
+    protocol: TCP
+    {{- if and (eq .Values.wizard.service.type "NodePort") .Values.wizard.service.nodePort }}
+    nodePort: {{ .Values.wizard.service.nodePort }}
+    {{- end }}
+{{- end }}

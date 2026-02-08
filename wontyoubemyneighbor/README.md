@@ -4,6 +4,8 @@
 
 **A production-ready multi-agent network platform where intelligent agents self-configure, self-test, and communicate using real routing protocols.**
 
+docker build --no-cache -t wontyoubemyneighbor:latest -f dockerfile .
+
 [![RFC 2328](https://img.shields.io/badge/RFC-2328-blue)](https://datatracker.ietf.org/doc/html/rfc2328)
 [![RFC 4271](https://img.shields.io/badge/RFC-4271-purple)](https://datatracker.ietf.org/doc/html/rfc4271)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)

@@ -155,11 +155,82 @@ class GREManager:
         self._running = True
         self._started_at = datetime.now()
 
+        # Discover existing GRE tunnels from environment variables
+        await self._discover_existing_tunnels()
+
         # Start passive listener if enabled
         if self.enable_passive:
             await self._start_passive_listener()
 
-        self.logger.info(f"GRE manager started (passive={'enabled' if self.enable_passive else 'disabled'})")
+        self.logger.info(f"GRE manager started (passive={'enabled' if self.enable_passive else 'disabled'}, tunnels={self.tunnel_count})")
+
+    async def _discover_existing_tunnels(self):
+        """
+        Discover existing GRE tunnels from environment variables
+
+        Reads GRE_TUNNEL_* environment variables set by docker-entrypoint.sh
+        and registers them with the manager for dashboard visibility.
+
+        Format: GRE_TUNNEL_<name>=<name>:<local_ip>:<remote_ip>:<tunnel_ip>:<key>:<ttl>:<mtu>
+        Example: GRE_TUNNEL_0=gre0:192.168.100.10:192.168.100.20:10.255.0.1/30:100:64:1400
+        """
+        import os
+        import re
+
+        discovered_count = 0
+
+        for env_var, value in os.environ.items():
+            if not env_var.startswith("GRE_TUNNEL_"):
+                continue
+
+            try:
+                # Parse: name:local_ip:remote_ip:tunnel_ip:key:ttl:mtu
+                parts = value.split(':')
+                if len(parts) < 4:
+                    self.logger.warning(f"Invalid GRE tunnel config in {env_var}: {value}")
+                    continue
+
+                name = parts[0]
+                local_ip = parts[1]
+                remote_ip = parts[2]
+                tunnel_ip = parts[3]
+                key = int(parts[4]) if len(parts) > 4 and parts[4] and parts[4] != "none" else None
+                ttl = int(parts[5]) if len(parts) > 5 else 64
+                mtu = int(parts[6]) if len(parts) > 6 else 1400
+
+                # Create tunnel config
+                from .tunnel import GRETunnelConfig, TunnelDirection, TunnelMode
+                config = GRETunnelConfig(
+                    name=name,
+                    local_ip=local_ip,
+                    remote_ip=remote_ip,
+                    tunnel_ip=tunnel_ip,
+                    key=key,
+                    mtu=mtu,
+                    ttl=ttl,
+                    direction=TunnelDirection.BIDIRECTIONAL,
+                    mode=TunnelMode.POINT_TO_POINT  # System tunnels use P2P mode
+                )
+
+                # Create tunnel object (it already exists in system, so we just register it)
+                from .tunnel import GRETunnel
+                tunnel = GRETunnel(config)
+                tunnel._state = TUNNEL_STATE_UP  # Assume it's up since it was created by entrypoint.sh
+                tunnel._state_reason = "Discovered from environment"
+
+                # Register with manager
+                self._tunnels[name] = tunnel
+                endpoint_key = f"{local_ip}-{remote_ip}"
+                self._tunnels_by_endpoint[endpoint_key] = tunnel
+
+                discovered_count += 1
+                self.logger.info(f"Discovered existing GRE tunnel: {name} ({local_ip} -> {remote_ip}, key={key})")
+
+            except Exception as e:
+                self.logger.error(f"Error discovering tunnel from {env_var}: {e}")
+
+        if discovered_count > 0:
+            self.logger.info(f"Discovered {discovered_count} existing GRE tunnel(s)")
 
     async def stop(self):
         """Stop the GRE manager and all tunnels"""
@@ -217,15 +288,15 @@ class GREManager:
         # Set packet callback
         tunnel.set_packet_callback(self._on_tunnel_packet)
 
+        # Store tunnel before starting (so it shows in dashboard even if start fails)
+        self._tunnels[config.name] = tunnel
+        self._tunnels_by_endpoint[endpoint_key] = tunnel
+
         # Start tunnel
         success = await tunnel.start()
         if not success:
             self.logger.error(f"Failed to start tunnel {config.name}")
-            return None
-
-        # Store tunnel
-        self._tunnels[config.name] = tunnel
-        self._tunnels_by_endpoint[endpoint_key] = tunnel
+            return tunnel  # Return the tunnel object (state=FAILED) so caller knows it exists
 
         # Notify callback
         if self._tunnel_up_callback:
@@ -280,6 +351,10 @@ class GREManager:
             if tunnel.config.remote_ip == remote_ip:
                 return tunnel
         return None
+
+    def get_tunnels(self) -> list:
+        """Get all tunnel objects"""
+        return list(self._tunnels.values())
 
     def list_tunnels(self) -> List[Dict[str, Any]]:
         """List all tunnels with status"""

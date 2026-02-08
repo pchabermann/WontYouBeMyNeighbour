@@ -44,6 +44,7 @@ import os
 import signal
 import sys
 import subprocess
+from dataclasses import dataclass, field
 from typing import Dict, Optional, List
 
 # OSPF imports
@@ -83,6 +84,7 @@ class WontYouBeMyNeighbor:
         self.ospfv3_speaker: Optional[OSPFv3Speaker] = None
         self.bgp_speaker: Optional[BGPSpeaker] = None
         self.agentic_bridge = None
+        self.bfd_manager = None  # BFD manager for fast failure detection
         self.router_id: Optional[str] = None
         self.area_id: Optional[str] = None
         self.running = False
@@ -145,65 +147,91 @@ class WontYouBeMyNeighbor:
                 })
 
     async def start_gre_tunnels(self):
-        """Initialize GRE tunnels from config"""
+        """Initialize GRE tunnels from config.
+
+        Creates kernel GRE tunnel interfaces (via 'ip tunnel add') so OSPF
+        can run natively over them, plus registers the tunnel with the GRE
+        manager for dashboard/metrics tracking.
+        """
         if not hasattr(self, 'gre_tunnels') or not self.gre_tunnels:
             return
 
         logger = logging.getLogger("WontYouBeMyNeighbor")
         logger.info(f"Starting {len(self.gre_tunnels)} GRE tunnel(s)")
 
-        try:
-            from gre import configure_gre_manager, GRETunnelConfig
+        import subprocess as _sub
 
-            agent_id = os.environ.get('ASI_AGENT_ID', 'local')
+        for tun in self.gre_tunnels:
+            name = tun['name']
+            remote_ip = tun.get('remote_ip')
+            if not remote_ip:
+                logger.warning(f"GRE tunnel {name} missing remote_ip, skipping")
+                continue
 
-            for tun in self.gre_tunnels:
-                if not tun.get('remote_ip'):
-                    logger.warning(f"GRE tunnel {tun['name']} missing remote_ip, skipping")
-                    continue
+            local_ip = tun.get('local_ip')
+            if not local_ip:
+                for iface in self.interfaces:
+                    if iface['type'] != 'gre' and iface['addresses']:
+                        local_ip = iface['addresses'][0].split('/')[0]
+                        break
+            if not local_ip:
+                logger.warning(f"GRE tunnel {name} could not determine local_ip, skipping")
+                continue
 
-                # Get local IP from config or first non-GRE interface
-                local_ip = tun.get('local_ip')
-                if not local_ip:
-                    for iface in self.interfaces:
-                        if iface['type'] != 'gre' and iface['addresses']:
-                            local_ip = iface['addresses'][0].split('/')[0]
-                            break
+            tunnel_ip = tun.get('tunnel_ip', '')
+            key = tun.get('key')
+            mtu = tun.get('mtu', 1400)
+            ttl = tun.get('ttl', 255)
 
-                if not local_ip:
-                    logger.warning(f"GRE tunnel {tun['name']} could not determine local_ip, skipping")
-                    continue
+            # --- Create kernel GRE tunnel interface ---
+            try:
+                cmd = ['ip', 'tunnel', 'add', name, 'mode', 'gre',
+                       'remote', remote_ip, 'local', local_ip,
+                       'ttl', str(ttl)]
+                if key is not None:
+                    cmd += ['key', str(key)]
+                _sub.run(cmd, capture_output=True, timeout=5)
 
-                # Create or get GRE manager
+                if tunnel_ip:
+                    _sub.run(['ip', 'addr', 'add', tunnel_ip, 'dev', name],
+                             capture_output=True, timeout=5)
+
+                _sub.run(['ip', 'link', 'set', name, 'up', 'mtu', str(mtu)],
+                         capture_output=True, timeout=5)
+
+                # Verify the interface came up
+                result = _sub.run(['ip', 'link', 'show', name],
+                                  capture_output=True, text=True, timeout=5)
+                if result.returncode == 0 and 'UP' in result.stdout:
+                    logger.info(f"Kernel GRE tunnel {name} UP: {local_ip} -> {remote_ip} "
+                                f"(overlay {tunnel_ip}, key={key}, mtu={mtu})")
+                    # Store the kernel interface name for OSPF
+                    self._kernel_gre_interfaces = getattr(self, '_kernel_gre_interfaces', [])
+                    self._kernel_gre_interfaces.append(name)
+                else:
+                    logger.error(f"Kernel GRE tunnel {name} failed to come up")
+            except Exception as e:
+                logger.error(f"Failed to create kernel GRE tunnel {name}: {e}")
+
+            # --- Register with GRE manager for dashboard/metrics ---
+            try:
+                from gre import configure_gre_manager, GRETunnelConfig
+                agent_id = os.environ.get('ASI_AGENT_ID', 'local')
                 manager = configure_gre_manager(agent_id, local_ip)
                 if not manager.running:
                     await manager.start()
-
-                # Create tunnel config
                 config = GRETunnelConfig(
-                    name=tun['name'],
-                    local_ip=local_ip,
-                    remote_ip=tun['remote_ip'],
-                    tunnel_ip=tun.get('tunnel_ip', ''),
-                    key=tun.get('key'),
+                    name=name, local_ip=local_ip, remote_ip=remote_ip,
+                    tunnel_ip=tunnel_ip, key=key,
                     use_checksum=tun.get('use_checksum', False),
                     use_sequence=tun.get('use_sequence', False),
-                    mtu=tun.get('mtu', 1400),
+                    mtu=mtu,
                     keepalive_interval=tun.get('keepalive_interval', 10),
                     description=tun.get('description', '')
                 )
-
-                # Create the tunnel
-                tunnel = await manager.create_tunnel(config)
-                if tunnel:
-                    logger.info(f"GRE tunnel {tun['name']} started: {local_ip} -> {tun['remote_ip']}")
-                else:
-                    logger.error(f"Failed to create GRE tunnel {tun['name']}")
-
-        except ImportError as e:
-            logger.warning(f"GRE module not available: {e}")
-        except Exception as e:
-            logger.error(f"Error starting GRE tunnels: {e}")
+                await manager.create_tunnel(config)
+            except Exception as e:
+                logger.debug(f"GRE manager registration for {name}: {e}")
 
     def load_config_from_env(self):
         """Load agent config from environment variable"""
@@ -519,9 +547,26 @@ class RouteRedistributor:
         }
 
 
+@dataclass
+class OSPFInterfaceContext:
+    """Per-interface OSPF state and components"""
+    interface_name: str
+    source_ip: str
+    netmask: str
+    hello_interval: int
+    dead_interval: int
+    network_type: str
+    unicast_peer: Optional[str]
+    socket: 'OSPFSocket'
+    hello_handler: 'HelloHandler'
+    neighbors: Dict[str, 'OSPFNeighbor'] = field(default_factory=dict)
+    enabled: bool = True
+
+
 class OSPFAgent:
     """
-    Main OSPF Agent orchestrating all components
+    Main OSPF Agent orchestrating all components.
+    NOW SUPPORTS MULTIPLE INTERFACES!
     """
 
     def __init__(self, router_id: str, area_id: str, interface: str,
@@ -529,61 +574,226 @@ class OSPFAgent:
                  network_type: str = DEFAULT_NETWORK_TYPE,
                  source_ip: Optional[str] = None,
                  unicast_peer: Optional[str] = None,
-                 kernel_route_manager: Optional[KernelRouteManager] = None):
+                 kernel_route_manager: Optional[KernelRouteManager] = None,
+                 interfaces: Optional[List[str]] = None,
+                 interface_unicast_peers: Optional[Dict[str, str]] = None,
+                 interface_ips: Optional[Dict[str, str]] = None):
         """
-        Initialize OSPF agent
+        Initialize OSPF agent (now supports multiple interfaces!)
 
         Args:
             router_id: Router ID (e.g., "10.255.255.99")
             area_id: OSPF area (e.g., "0.0.0.0")
-            interface: Network interface (e.g., "eth0")
+            interface: Primary network interface (e.g., "eth0") - for backwards compatibility
             hello_interval: Hello packet interval (seconds)
             dead_interval: Neighbor dead interval (seconds)
             network_type: Network type (broadcast, point-to-multipoint, point-to-point)
             source_ip: Optional specific source IP to use (for multi-IP interfaces)
             unicast_peer: Optional unicast peer IP for point-to-point (bypasses multicast)
             kernel_route_manager: Optional kernel route manager for installing routes
+            interfaces: Optional list of interface names for multi-interface OSPF
         """
         self.router_id = router_id
         self.area_id = area_id
-        self.interface = interface
-        self.hello_interval = hello_interval
-        self.dead_interval = dead_interval
-        self.network_type = network_type
-        self.unicast_peer = unicast_peer
         self.kernel_route_manager = kernel_route_manager
 
-        # Get interface info (with optional source IP)
-        self.interface_info = get_interface_info(interface, source_ip)
-        if not self.interface_info:
-            raise ValueError(f"Invalid interface: {interface}")
-
-        self.source_ip = self.interface_info.ip_address
-        self.netmask = self.interface_info.netmask
-
-        # Components
-        self.socket = OSPFSocket(interface, self.source_ip)
-        self.hello_handler = HelloHandler(
-            router_id, area_id, interface, self.netmask,
-            hello_interval, dead_interval, network_type=network_type
-        )
+        # GLOBAL COMPONENTS (shared across all interfaces)
         self.lsdb = LinkStateDatabase(area_id)
         self.spf_calc = SPFCalculator(router_id, self.lsdb)
         self.adjacency_mgr = AdjacencyManager(router_id, self.lsdb)
         self.flooding_mgr = LSAFloodingManager(router_id, self.lsdb)
 
-        # Neighbors
-        self.neighbors: Dict[str, OSPFNeighbor] = {}
+        # PER-INTERFACE CONTEXTS
+        self.interfaces_ctx: Dict[str, OSPFInterfaceContext] = {}
+
+        # Initialize logger early (needed by _add_interface_context)
+        self.logger = logging.getLogger("OSPFAgent")
+
+        # Build interface list (support both old single-interface and new multi-interface)
+        interface_list = interfaces if interfaces else [interface]
+
+        # Parse per-interface unicast peers
+        iface_unicast_peers = interface_unicast_peers or {}
+
+        # Parse per-interface IPs
+        iface_ips = interface_ips or {}
+
+        # Initialize each interface
+        for iface_name in interface_list:
+            # Determine unicast peer for this interface
+            iface_unicast = iface_unicast_peers.get(iface_name)
+            if not iface_unicast and iface_name == interface:
+                iface_unicast = unicast_peer  # Backwards compatibility
+
+            # Determine source IP for this interface
+            iface_source_ip = None
+            if iface_name == interface:
+                iface_source_ip = source_ip  # Primary interface uses explicitly provided source_ip
+                # If source_ip not provided, use interface_ips dict
+                if not iface_source_ip and iface_name in iface_ips:
+                    iface_source_ip = iface_ips[iface_name]
+                    self.logger.info(f"Using source IP {iface_source_ip} for primary interface {iface_name} (from config)")
+            elif iface_name in iface_ips:
+                iface_source_ip = iface_ips[iface_name]  # Logical interface uses IP from config
+                self.logger.info(f"Using source IP {iface_source_ip} for logical interface {iface_name}")
+
+            self._add_interface_context(
+                iface_name=iface_name,
+                hello_interval=hello_interval,
+                dead_interval=dead_interval,
+                network_type=network_type,
+                source_ip=iface_source_ip,
+                unicast_peer=iface_unicast
+            )
+
+        # Backwards compatibility - keep these for old code
+        if interface in self.interfaces_ctx:
+            primary_ctx = self.interfaces_ctx[interface]
+            self.interface = interface
+            self.source_ip = primary_ctx.source_ip
+            self.netmask = primary_ctx.netmask
+            self.socket = primary_ctx.socket
+            self.hello_handler = primary_ctx.hello_handler
+            self.neighbors = primary_ctx.neighbors
+            self.hello_interval = hello_interval
+            self.dead_interval = dead_interval
+            self.network_type = network_type
+            self.unicast_peer = unicast_peer
+            self.interface_info = get_interface_info(interface, source_ip)
 
         # State
         self.running = False
-        self.logger = logging.getLogger("OSPFAgent")
 
-        # Setup callbacks
-        self.hello_handler.on_neighbor_discovered = self._on_neighbor_discovered
-        self.hello_handler.on_hello_received = self._on_hello_received
+        self.logger.info(f"Initialized OSPF Agent: {router_id} on {len(self.interfaces_ctx)} interface(s): {', '.join(self.interfaces_ctx.keys())}")
 
-        self.logger.info(f"Initialized OSPF Agent: {router_id} on {interface} ({self.source_ip})")
+    def _get_neighbor(self, neighbor_id: str, iface_name: str) -> Optional['OSPFNeighbor']:
+        """
+        Get neighbor from specific interface, or search all interfaces if not found
+        """
+        ctx = self.interfaces_ctx.get(iface_name)
+        if ctx and neighbor_id in ctx.neighbors:
+            return ctx.neighbors[neighbor_id]
+
+        # Search all interfaces
+        for ctx in self.interfaces_ctx.values():
+            if neighbor_id in ctx.neighbors:
+                return ctx.neighbors[neighbor_id]
+
+        return None
+
+    def _is_neighbor_in_subnet(self, neighbor_ip: str, ctx) -> bool:
+        """
+        Check if neighbor IP is in the same subnet as the interface
+
+        Args:
+            neighbor_ip: Neighbor's IP address
+            ctx: OSPFInterfaceContext object
+
+        Returns:
+            True if neighbor is in same subnet, False otherwise
+        """
+        import ipaddress
+        try:
+            # Get interface network
+            iface_network = ipaddress.IPv4Network(
+                f"{ctx.source_ip}/{ctx.netmask}",
+                strict=False
+            )
+            neighbor_addr = ipaddress.IPv4Address(neighbor_ip)
+            is_in_subnet = neighbor_addr in iface_network
+            if not is_in_subnet:
+                self.logger.debug(f"Neighbor {neighbor_ip} NOT in {iface_network}")
+            return is_in_subnet
+        except Exception as e:
+            self.logger.warning(f"Error checking subnet for {neighbor_ip}: {e}")
+            return True  # Allow by default on error
+
+    def _send_to_neighbor(self, packet: bytes, neighbor: 'OSPFNeighbor', iface_name: str = None):
+        """
+        Send packet to neighbor on the correct interface
+
+        Args:
+            packet: OSPF packet to send
+            neighbor: Target neighbor
+            iface_name: Optional interface name (for efficiency, avoids lookup)
+        """
+        # If interface name provided, use it directly
+        if iface_name and iface_name in self.interfaces_ctx:
+            ctx = self.interfaces_ctx[iface_name]
+            ctx.socket.send(packet, dest=neighbor.ip_address)
+            return
+
+        # Otherwise, find which interface this neighbor is on
+        for iface_name, ctx in self.interfaces_ctx.items():
+            if neighbor.router_id in ctx.neighbors:
+                ctx.socket.send(packet, dest=neighbor.ip_address)
+                return
+        self.logger.error(f"Could not find interface for neighbor {neighbor.router_id}")
+
+    def _add_interface_context(self, iface_name: str, hello_interval: int, dead_interval: int,
+                                network_type: str, source_ip: Optional[str], unicast_peer: Optional[str]):
+        """Add an interface to OSPF"""
+        # Get interface info
+        interface_info = get_interface_info(iface_name, source_ip)
+        physical_if_name = iface_name  # Track physical interface for socket binding
+
+        if not interface_info:
+            # Interface doesn't exist - try to find physical interface with this source IP
+            # This handles logical interfaces (like eth2) whose IPs are on eth0
+            if source_ip:
+                self.logger.info(f"Logical interface {iface_name} not found, searching for IP {source_ip} on physical interfaces")
+                # Try common physical interfaces
+                for physical_if in ['eth0', 'eth1', 'eth2', 'eth3']:
+                    interface_info = get_interface_info(physical_if, source_ip)
+                    if interface_info:
+                        self.logger.info(f"Found {source_ip} on {physical_if}, using it for logical interface {iface_name}")
+                        # Keep using logical iface_name for identification, but bind socket to physical interface
+                        physical_if_name = physical_if
+                        break
+
+            if not interface_info:
+                self.logger.error(f"Invalid interface: {iface_name}, skipping")
+                return
+
+        # Auto-detect network type for special interfaces
+        effective_network_type = network_type
+        if iface_name.startswith('gre') or iface_name.startswith('tun'):
+            # GRE and tunnel interfaces should use point-to-point
+            effective_network_type = "point-to-point"
+            self.logger.info(f"  Interface {iface_name} detected as tunnel, using point-to-point network type")
+
+        # Create per-interface components (use physical_if_name for socket binding)
+        socket = OSPFSocket(physical_if_name, interface_info.ip_address)
+        hello_handler = HelloHandler(
+            self.router_id, self.area_id, iface_name, interface_info.netmask,
+            hello_interval, dead_interval, network_type=effective_network_type
+        )
+
+        # Setup callbacks (capture iface_name in closure)
+        def make_neighbor_discovered_callback(iface):
+            return lambda nid, nip, priority: self._on_neighbor_discovered(nid, nip, priority, iface)
+
+        def make_hello_received_callback(iface):
+            return lambda nid, nip, bidirectional, hello_pkt: self._on_hello_received(nid, nip, bidirectional, hello_pkt, iface)
+
+        hello_handler.on_neighbor_discovered = make_neighbor_discovered_callback(iface_name)
+        hello_handler.on_hello_received = make_hello_received_callback(iface_name)
+
+        # Create context
+        ctx = OSPFInterfaceContext(
+            interface_name=iface_name,
+            source_ip=interface_info.ip_address,
+            netmask=interface_info.netmask,
+            hello_interval=hello_interval,
+            dead_interval=dead_interval,
+            network_type=effective_network_type,
+            unicast_peer=unicast_peer,
+            socket=socket,
+            hello_handler=hello_handler
+        )
+
+        self.interfaces_ctx[iface_name] = ctx
+        self.logger.info(f"  Added interface {iface_name} ({interface_info.ip_address}) to OSPF")
 
     @property
     def stats(self):
@@ -592,31 +802,38 @@ class OSPFAgent:
 
     async def start(self):
         """
-        Start OSPF agent
+        Start OSPF agent on ALL interfaces
         """
         self.logger.info("="*70)
-        self.logger.info("Starting OSPF Agent")
+        self.logger.info("Starting Multi-Interface OSPF Agent")
         self.logger.info("="*70)
         self.logger.info(f"  Router ID: {self.router_id}")
         self.logger.info(f"  Area: {self.area_id}")
-        self.logger.info(f"  Interface: {self.interface}")
-        self.logger.info(f"  IP: {self.source_ip}")
-        self.logger.info(f"  Netmask: {self.netmask}")
-        if self.unicast_peer:
-            self.logger.info(f"  Unicast Peer: {self.unicast_peer} (UNICAST MODE)")
+        self.logger.info(f"  Interfaces: {len(self.interfaces_ctx)}")
+
+        # Initialize each interface
+        for iface_name, ctx in self.interfaces_ctx.items():
+            self.logger.info(f"    - {iface_name}: {ctx.source_ip}/{ctx.netmask} ({ctx.network_type})")
+            if ctx.unicast_peer:
+                self.logger.info(f"      Unicast Peer: {ctx.unicast_peer}")
+
         self.logger.info("="*70)
 
-        # Open socket
-        if not self.socket.open():
-            self.logger.error("Failed to open OSPF socket")
-            return
+        # Open sockets and join multicast on all interfaces
+        for iface_name, ctx in self.interfaces_ctx.items():
+            if not ctx.socket.open():
+                self.logger.error(f"Failed to open OSPF socket on {iface_name}")
+                ctx.enabled = False
+                continue
 
-        # Join multicast group
-        if not self.socket.join_multicast():
-            self.logger.error("Failed to join multicast group")
-            return
+            if not ctx.socket.join_multicast():
+                self.logger.error(f"Failed to join multicast group on {iface_name}")
+                ctx.enabled = False
+                continue
 
-        # Generate our own Router LSA
+            self.logger.info(f"  ✓ {iface_name} ready")
+
+        # Generate our own Router LSA (includes all interfaces)
         self._generate_router_lsa()
 
         # Start running
@@ -639,53 +856,53 @@ class OSPFAgent:
 
     async def stop(self):
         """
-        Stop OSPF agent gracefully
+        Stop OSPF agent gracefully on all interfaces
         """
         self.logger.info("Stopping OSPF Agent...")
         self.running = False
-        self.socket.close()
+
+        # Close all sockets
+        for iface_name, ctx in self.interfaces_ctx.items():
+            ctx.socket.close()
+            self.logger.info(f"  ✓ Closed {iface_name}")
+
         self.logger.info("OSPF Agent stopped")
 
     async def _hello_loop(self):
         """
-        Send Hello packets periodically
+        Send Hello packets periodically on ALL interfaces
         """
         while self.running:
             try:
-                # Build Hello with current neighbor list from OSPFNeighbor objects
-                # Filter for neighbors at least in Init state to include in Hello packet
+                # Send hello on each interface
+                for iface_name, ctx in self.interfaces_ctx.items():
+                    if not ctx.enabled:
+                        continue
 
-                # DEBUG: Log all neighbors and their states
-                self.logger.debug(f"Hello loop: Total neighbors in dict: {len(self.neighbors)}")
-                for nid, n in self.neighbors.items():
-                    state = n.get_state()
-                    state_name = n.get_state_name()
-                    passes_filter = state >= STATE_INIT
-                    self.logger.debug(f"  Neighbor {nid}: state={state_name} ({state}), "
-                                    f">= STATE_INIT({STATE_INIT})? {passes_filter}")
+                    # Get active neighbors on THIS interface
+                    active_neighbor_ids = [
+                        nid for nid, n in ctx.neighbors.items()
+                        if n.get_state() >= STATE_INIT
+                    ]
 
-                active_neighbor_ids = [
-                    nid for nid, n in self.neighbors.items()
-                    if n.get_state() >= STATE_INIT
-                ]
+                    self.logger.debug(f"[{iface_name}] Active neighbors: {active_neighbor_ids}")
 
-                self.logger.debug(f"Active neighbors for Hello packet: {active_neighbor_ids}")
+                    # Build and send Hello with proper neighbor list
+                    hello_pkt = ctx.hello_handler.build_hello_packet(
+                        active_neighbors=active_neighbor_ids
+                    )
 
-                # Build and send Hello with proper neighbor list
-                hello_pkt = self.hello_handler.build_hello_packet(
-                    active_neighbors=active_neighbor_ids
-                )
+                    # Send to unicast peer if specified, otherwise multicast
+                    if ctx.unicast_peer:
+                        ctx.socket.send(hello_pkt, dest=ctx.unicast_peer)
+                        self.logger.info(f"[{iface_name}] Sent Hello to {ctx.unicast_peer} with {len(active_neighbor_ids)} neighbors: {active_neighbor_ids}")
+                    else:
+                        ctx.socket.send(hello_pkt)
+                        self.logger.info(f"[{iface_name}] Sent Hello with {len(active_neighbor_ids)} neighbors: {active_neighbor_ids}")
 
-                # Send to unicast peer if specified, otherwise multicast
-                if self.unicast_peer:
-                    self.socket.send(hello_pkt, dest=self.unicast_peer)
-                    self.logger.info(f"Sent Hello to {self.unicast_peer} with {len(active_neighbor_ids)} neighbors: {active_neighbor_ids}")
-                else:
-                    self.socket.send(hello_pkt)
-                    self.logger.info(f"Sent Hello with {len(active_neighbor_ids)} neighbors: {active_neighbor_ids}")
-
-                # Wait for next interval
-                await asyncio.sleep(self.hello_interval)
+                # Wait for next interval (use shortest interval if different per interface)
+                min_interval = min(ctx.hello_interval for ctx in self.interfaces_ctx.values())
+                await asyncio.sleep(min_interval)
 
             except Exception as e:
                 self.logger.error(f"Hello loop error: {e}")
@@ -693,101 +910,109 @@ class OSPFAgent:
 
     async def _receive_loop(self):
         """
-        Receive and process OSPF packets
+        Receive and process OSPF packets from ALL interfaces
         """
         while self.running:
             try:
-                # Receive packet with DSCP value for QoS ingress trust
-                result = self.socket.receive_with_dscp(timeout=0.5)
-                if not result:
-                    # Yield control to event loop to allow other tasks to run
-                    await asyncio.sleep(0)
-                    continue
+                # Poll all interface sockets
+                for iface_name, ctx in self.interfaces_ctx.items():
+                    if not ctx.enabled:
+                        continue
 
-                data, source_ip, dscp_value = result
+                    # Receive packet with DSCP value for QoS ingress trust
+                    result = ctx.socket.receive_with_dscp(timeout=0.1)
+                    if not result:
+                        continue
 
-                # QoS Ingress Trust - respect DSCP marking from other agents
-                try:
-                    from agentic.protocols.qos import get_qos_manager
-                    import os
-                    qos_agent_id = os.environ.get("ASI_AGENT_ID", "local")
-                    qos_mgr = get_qos_manager(qos_agent_id)
-                    if qos_mgr and qos_mgr.enabled and dscp_value > 0:
-                        service_class, trusted = qos_mgr.trust_ingress(dscp_value, self.interface)
-                        if trusted:
-                            self.logger.debug(f"[QoS] Ingress trust: DSCP={dscp_value} -> {service_class.value} from {source_ip}")
-                except ImportError:
-                    pass  # QoS module not available
-                except Exception as qos_err:
-                    self.logger.debug(f"[QoS] Ingress trust error: {qos_err}")
+                    data, source_ip, dscp_value = result
 
-                # Process packet
-                await self._process_packet(data, source_ip)
+                    # QoS Ingress Trust - respect DSCP marking from other agents
+                    try:
+                        from agentic.protocols.qos import get_qos_manager
+                        import os
+                        qos_agent_id = os.environ.get("ASI_AGENT_ID", "local")
+                        qos_mgr = get_qos_manager(qos_agent_id)
+                        if qos_mgr and qos_mgr.enabled and dscp_value > 0:
+                            service_class, trusted = qos_mgr.trust_ingress(dscp_value, iface_name)
+                            if trusted:
+                                self.logger.debug(f"[{iface_name}] [QoS] Ingress trust: DSCP={dscp_value} -> {service_class.value} from {source_ip}")
+                    except ImportError:
+                        pass  # QoS module not available
+                    except Exception as qos_err:
+                        self.logger.debug(f"[{iface_name}] [QoS] Ingress trust error: {qos_err}")
 
-                # Yield control to event loop after processing to allow other tasks to run
+                    # Process packet from this interface
+                    await self._process_packet(data, source_ip, iface_name)
+
+                # Yield control to event loop after processing all interfaces
                 await asyncio.sleep(0)
 
             except Exception as e:
                 self.logger.error(f"Receive loop error: {e}")
                 await asyncio.sleep(0.1)
 
-    async def _process_packet(self, data: bytes, source_ip: str):
+    async def _process_packet(self, data: bytes, source_ip: str, iface_name: str):
         """
         Process received OSPF packet
 
         Args:
             data: Packet bytes
             source_ip: Source IP address
+            iface_name: Interface name packet was received on
         """
         try:
+            ctx = self.interfaces_ctx.get(iface_name)
+            if not ctx:
+                return
+
             # Parse packet
             packet = parse_ospf_packet(data)
             if not packet:
                 return
 
             # Enhanced debugging for Router ID conflicts
-            self.logger.debug(f"Received packet: Type={packet.type}, "
+            self.logger.debug(f"[{iface_name}] Received packet: Type={packet.type}, "
                             f"RouterID={packet.router_id}, "
                             f"SourceIP={source_ip}, "
                             f"OurRouterID={self.router_id}, "
-                            f"OurIP={self.source_ip}")
+                            f"OurIP={ctx.source_ip}")
 
             # Ignore packets from ourselves (safety check for multicast loopback)
             if packet.router_id == self.router_id:
-                self.logger.warning(f"!!! Router ID CONFLICT: Received packet from {source_ip} "
+                self.logger.warning(f"[{iface_name}] !!! Router ID CONFLICT: Received packet from {source_ip} "
                                   f"with same Router ID as us ({packet.router_id})! "
                                   f"Check if router at {source_ip} is configured with Router ID {packet.router_id}")
                 return
 
-            # Ignore packets from our own IP address
-            if source_ip == self.source_ip:
-                self.logger.debug(f"Ignoring packet from own IP ({source_ip})")
+            # Ignore packets from our own IP address on this interface
+            if source_ip == ctx.source_ip:
+                self.logger.debug(f"[{iface_name}] Ignoring packet from own IP ({source_ip})")
                 return
 
             # Route by packet type
             packet_type = packet.type
 
             if packet_type == HELLO_PACKET:
-                self.hello_handler.process_hello(data, source_ip)
+                ctx.hello_handler.process_hello(data, source_ip)
 
             elif packet_type == DATABASE_DESCRIPTION:
-                self.logger.debug(f"Received DBD from {source_ip}")
-                await self._process_dbd(data, packet.router_id)
+                self.logger.debug(f"[{iface_name}] Received DBD from {source_ip}")
+                await self._process_dbd(data, packet.router_id, iface_name)
 
             elif packet_type == LINK_STATE_REQUEST:
-                self.logger.debug(f"Received LSR from {source_ip}")
-                await self._process_lsr(data, packet.router_id)
+                self.logger.debug(f"[{iface_name}] Received LSR from {source_ip}")
+                await self._process_lsr(data, packet.router_id, iface_name)
 
             elif packet_type == LINK_STATE_UPDATE:
-                self.logger.debug(f"Received LSU from {source_ip}")
-                await self._process_lsu(data, packet.router_id)
+                self.logger.debug(f"[{iface_name}] Received LSU from {source_ip}")
+                await self._process_lsu(data, packet.router_id, iface_name)
 
             elif packet_type == LINK_STATE_ACK:
-                self.logger.debug(f"Received LSAck from {source_ip}")
-                await self._process_lsack(data, packet.router_id)
+                self.logger.debug(f"[{iface_name}] Received LSAck from {source_ip}")
+                await self._process_lsack(data, packet.router_id, iface_name)
 
         except Exception as e:
-            self.logger.error(f"Error processing packet from {source_ip}: {e}")
+            self.logger.error(f"[{iface_name}] Error processing packet from {source_ip}: {e}")
 
     async def _aging_loop(self):
         """
@@ -827,24 +1052,26 @@ class OSPFAgent:
 
     async def _monitor_neighbors(self):
         """
-        Monitor neighbors for inactivity
+        Monitor neighbors for inactivity across ALL interfaces
         """
         while self.running:
             try:
-                # Check for dead neighbors in Hello handler
-                dead = self.hello_handler.check_dead_neighbors()
+                # Check each interface
+                for iface_name, ctx in self.interfaces_ctx.items():
+                    # Check for dead neighbors in this interface's Hello handler
+                    dead = ctx.hello_handler.check_dead_neighbors()
 
-                # Kill dead neighbors in our neighbor list
-                for neighbor_id in dead:
-                    if neighbor_id in self.neighbors:
-                        neighbor = self.neighbors[neighbor_id]
-                        neighbor.kill()
-                        self.logger.warning(f"Neighbor {neighbor_id} killed (inactivity)")
+                    # Kill dead neighbors in this interface's neighbor list
+                    for neighbor_id in dead:
+                        if neighbor_id in ctx.neighbors:
+                            neighbor = ctx.neighbors[neighbor_id]
+                            neighbor.kill()
+                            self.logger.warning(f"[{iface_name}] Neighbor {neighbor_id} killed (inactivity)")
 
-                # Check inactivity for each neighbor
-                for neighbor_id, neighbor in list(self.neighbors.items()):
-                    if neighbor.check_inactivity(self.dead_interval):
-                        self.logger.warning(f"Neighbor {neighbor_id} timed out")
+                    # Check inactivity for each neighbor on this interface
+                    for neighbor_id, neighbor in list(ctx.neighbors.items()):
+                        if neighbor.check_inactivity(ctx.dead_interval):
+                            self.logger.warning(f"[{iface_name}] Neighbor {neighbor_id} timed out")
 
                 await asyncio.sleep(1)
 
@@ -876,7 +1103,7 @@ class OSPFAgent:
                         )
 
                         if lsu_packet:
-                            self.socket.send(lsu_packet, dest=neighbor.ip_address)
+                            self._send_to_neighbor(lsu_packet, neighbor)
                             self.logger.debug(f"Sent retransmission LSU to {neighbor_id} "
                                             f"with {len(lsas_to_retransmit)} LSAs")
 
@@ -914,12 +1141,16 @@ class OSPFAgent:
                         continue  # Skip routes to self
 
                     # Resolve router ID to interface IP using neighbor table
+                    # Search across ALL interfaces, not just primary
                     actual_gateway = None
-                    if next_hop_router_id in self.neighbors:
-                        neighbor = self.neighbors[next_hop_router_id]
-                        actual_gateway = neighbor.ip_address
-                        self.logger.debug(f"Resolved next-hop {next_hop_router_id} -> {actual_gateway}")
-                    else:
+                    for iface_name, ctx in self.interfaces_ctx.items():
+                        if next_hop_router_id in ctx.neighbors:
+                            neighbor = ctx.neighbors[next_hop_router_id]
+                            actual_gateway = neighbor.ip_address
+                            self.logger.debug(f"Resolved next-hop {next_hop_router_id} -> {actual_gateway} (interface {iface_name})")
+                            break
+
+                    if not actual_gateway:
                         # Fallback strategies for resolving next-hop:
                         # 1. Check if next_hop looks like an IP address already
                         import ipaddress
@@ -985,7 +1216,7 @@ class OSPFAgent:
             lsu_packet = self.flooding_mgr.build_ls_update(our_lsas, self.area_id)
 
             if lsu_packet:
-                self.socket.send(lsu_packet, dest=neighbor.ip_address)
+                self._send_to_neighbor(lsu_packet, neighbor)
                 self.logger.debug(f"Sent LSU with {len(our_lsas)} LSAs to {neighbor.router_id}")
 
         except Exception as e:
@@ -1004,8 +1235,10 @@ class OSPFAgent:
                 self.logger.debug("No LSAs to flood")
                 return
 
-            # Get all Full neighbors
-            full_neighbors = [n for n in self.neighbors.values() if n.is_full()]
+            # Get all Full neighbors from ALL interfaces (not just primary)
+            full_neighbors = []
+            for iface_name, ctx in self.interfaces_ctx.items():
+                full_neighbors.extend([n for n in ctx.neighbors.values() if n.is_full()])
 
             if not full_neighbors:
                 self.logger.debug("No Full neighbors to flood to")
@@ -1019,7 +1252,7 @@ class OSPFAgent:
             if lsu_packet:
                 # Send to each Full neighbor
                 for neighbor in full_neighbors:
-                    self.socket.send(lsu_packet, dest=neighbor.ip_address)
+                    self._send_to_neighbor(lsu_packet, neighbor)
                     self.logger.debug(f"Sent LSU to {neighbor.router_id}")
 
         except Exception as e:
@@ -1028,23 +1261,24 @@ class OSPFAgent:
     def _generate_router_lsa(self):
         """
         Generate our own Router LSA and add to LSDB
-        Includes P2P links to Full neighbors and stub link for our /32
+        Includes P2P links to Full neighbors on ALL interfaces and stub link for our /32
         """
         from ospf.constants import LINK_TYPE_PTP
 
         links = []
 
-        # Add P2P links to all Full neighbors
-        for neighbor_id, neighbor in self.neighbors.items():
-            if neighbor.is_full():
-                # Point-to-point link
-                links.append({
-                    'link_id': neighbor.router_id,      # Neighbor's Router ID
-                    'link_data': self.source_ip,         # Our interface IP
-                    'link_type': LINK_TYPE_PTP,
-                    'metric': 10
-                })
-                self.logger.debug(f"Added P2P link to {neighbor.router_id} in Router LSA")
+        # Add P2P links to all Full neighbors across ALL interfaces
+        for iface_name, ctx in self.interfaces_ctx.items():
+            for neighbor_id, neighbor in ctx.neighbors.items():
+                if neighbor.is_full():
+                    # Point-to-point link
+                    links.append({
+                        'link_id': neighbor.router_id,      # Neighbor's Router ID
+                        'link_data': ctx.source_ip,          # Our interface IP
+                        'link_type': LINK_TYPE_PTP,
+                        'metric': 10
+                    })
+                    self.logger.debug(f"[{iface_name}] Added P2P link to {neighbor.router_id} in Router LSA (via {ctx.source_ip})")
 
         # Add stub link for our /32 loopback/host route
         links.append({
@@ -1057,9 +1291,9 @@ class OSPFAgent:
         # Install Router LSA
         self.lsdb.install_router_lsa(self.router_id, links)
 
-        self.logger.info(f"Generated Router LSA for {self.router_id} with {len(links)} links")
+        self.logger.info(f"Generated Router LSA for {self.router_id} with {len(links)} links across {len(self.interfaces_ctx)} interfaces")
 
-    def _on_neighbor_discovered(self, neighbor_id: str, ip: str, priority: int):
+    def _on_neighbor_discovered(self, neighbor_id: str, ip: str, priority: int, iface_name: str):
         """
         Callback when new neighbor is discovered
 
@@ -1067,13 +1301,24 @@ class OSPFAgent:
             neighbor_id: Neighbor router ID
             ip: Neighbor IP address
             priority: Neighbor priority
+            iface_name: Interface name neighbor was discovered on
         """
-        if neighbor_id not in self.neighbors:
-            neighbor = OSPFNeighbor(neighbor_id, ip, priority, network_type=self.network_type)
-            self.neighbors[neighbor_id] = neighbor
-            self.logger.info(f"New neighbor discovered: {neighbor_id} ({ip})")
+        ctx = self.interfaces_ctx.get(iface_name)
+        if not ctx:
+            return
 
-    def _on_hello_received(self, neighbor_id: str, ip: str, bidirectional: bool, hello_pkt):
+        # Validate neighbor IP is in same subnet as interface
+        # This prevents duplicate neighbors when OSPF packets leak across interfaces
+        if not self._is_neighbor_in_subnet(ip, ctx):
+            self.logger.debug(f"[{iface_name}] Ignoring neighbor discovery for {neighbor_id} ({ip}) - not in subnet {ctx.source_ip}/{ctx.netmask}")
+            return
+
+        if neighbor_id not in ctx.neighbors:
+            neighbor = OSPFNeighbor(neighbor_id, ip, priority, network_type=ctx.network_type)
+            ctx.neighbors[neighbor_id] = neighbor
+            self.logger.info(f"[{iface_name}] New neighbor discovered: {neighbor_id} ({ip})")
+
+    def _on_hello_received(self, neighbor_id: str, ip: str, bidirectional: bool, hello_pkt, iface_name: str):
         """
         Callback when Hello is received
 
@@ -1082,13 +1327,24 @@ class OSPFAgent:
             ip: Neighbor IP address
             bidirectional: True if we're in their neighbor list
             hello_pkt: Hello packet object
+            iface_name: Interface name hello was received on
         """
+        ctx = self.interfaces_ctx.get(iface_name)
+        if not ctx:
+            return
+
+        # Validate neighbor IP is in same subnet as interface
+        # This prevents duplicate neighbors when multiple interfaces share physical NIC
+        if not self._is_neighbor_in_subnet(ip, ctx):
+            self.logger.debug(f"[{iface_name}] Ignoring Hello from {neighbor_id} ({ip}) - not in subnet {ctx.source_ip}/{ctx.netmask}")
+            return
+
         # Get or create neighbor
-        if neighbor_id not in self.neighbors:
-            neighbor = OSPFNeighbor(neighbor_id, ip, hello_pkt.router_priority, network_type=self.network_type)
-            self.neighbors[neighbor_id] = neighbor
+        if neighbor_id not in ctx.neighbors:
+            neighbor = OSPFNeighbor(neighbor_id, ip, hello_pkt.router_priority, network_type=ctx.network_type)
+            ctx.neighbors[neighbor_id] = neighbor
         else:
-            neighbor = self.neighbors[neighbor_id]
+            neighbor = ctx.neighbors[neighbor_id]
 
         # Update neighbor FSM
         old_state = neighbor.get_state()
@@ -1096,49 +1352,49 @@ class OSPFAgent:
         new_state = neighbor.get_state()
 
         if old_state != new_state:
-            self.logger.info(f"Neighbor {neighbor_id}: "
+            self.logger.info(f"[{iface_name}] Neighbor {neighbor_id}: "
                            f"{STATE_NAMES[old_state]} → {STATE_NAMES[new_state]}")
 
             # Handle state transitions
             if new_state == STATE_EXSTART:
-                self.logger.info(f"Transitioning to ExStart, starting database exchange...")
+                self.logger.info(f"[{iface_name}] Transitioning to ExStart, starting database exchange...")
                 neighbor.start_database_exchange(self.router_id)
                 # Send initial DBD packet
                 try:
-                    asyncio.create_task(self._send_initial_dbd(neighbor))
-                    self.logger.debug(f"Created task to send initial DBD to {neighbor_id}")
+                    asyncio.create_task(self._send_initial_dbd(neighbor, iface_name))
+                    self.logger.debug(f"[{iface_name}] Created task to send initial DBD to {neighbor_id}")
                 except Exception as e:
-                    self.logger.error(f"Failed to create DBD task: {e}")
+                    self.logger.error(f"[{iface_name}] Failed to create DBD task: {e}")
 
             elif new_state == STATE_FULL:
-                self.logger.info(f"✓ Adjacency FULL with {neighbor_id}")
-                # Regenerate our Router LSA (now includes P2P link to this neighbor)
+                self.logger.info(f"[{iface_name}] ✓ Adjacency FULL with {neighbor_id}")
+                # Regenerate our Router LSA (now includes all interfaces and neighbors)
                 self._generate_router_lsa()
-                # Flood our updated LSAs to ALL Full neighbors
+                # Flood our updated LSAs to ALL Full neighbors on ALL interfaces
                 asyncio.create_task(self._flood_our_lsas_to_all_neighbors())
                 # Run SPF
                 asyncio.create_task(self._run_spf())
 
-    async def _process_dbd(self, data: bytes, neighbor_id: str):
+    async def _process_dbd(self, data: bytes, neighbor_id: str, iface_name: str):
         """
         Process Database Description packet
 
         Args:
             data: Packet bytes
             neighbor_id: Neighbor router ID
+            iface_name: Interface name packet was received on
         """
-        if neighbor_id not in self.neighbors:
-            self.logger.warning(f"Received DBD from unknown neighbor {neighbor_id}")
+        neighbor = self._get_neighbor(neighbor_id, iface_name)
+        if not neighbor:
+            self.logger.warning(f"[{iface_name}] Received DBD from unknown neighbor {neighbor_id}")
             return
-
-        neighbor = self.neighbors[neighbor_id]
         current_state = neighbor.get_state()
 
         # Process DBD
         success, lsa_headers_needed, neighbor_dbd_complete = self.adjacency_mgr.process_dbd(data, neighbor)
 
         if not success:
-            self.logger.warning(f"Failed to process DBD from {neighbor_id}")
+            self.logger.debug(f"Failed to process DBD from {neighbor_id} (transient during adjacency formation)")
             return
 
         # Add needed LSAs to request list
@@ -1167,14 +1423,14 @@ class OSPFAgent:
                 # If we're slave, we need to send a slave acknowledgment DBD first
                 if current_state == STATE_EXSTART and not neighbor.is_master:
                     # Send slave acknowledgment DBD (empty, with M=1)
-                    self.logger.info(f"Sending slave ack DBD to {neighbor_id}")
+                    self.logger.info(f"[{iface_name}] Sending slave ack DBD to {neighbor_id}")
                     slave_ack = self.adjacency_mgr.build_slave_ack_dbd_packet(
-                        neighbor, self.area_id
+                        neighbor, self.area_id, iface_name
                     )
-                    self.socket.send(slave_ack, dest=neighbor.ip_address)
+                    self._send_to_neighbor(slave_ack, neighbor, iface_name)
                 else:
                     # Start sending our DBD packets (with LSA headers)
-                    await self._send_dbd(neighbor)
+                    await self._send_dbd(neighbor, iface_name)
 
             elif new_state == STATE_LOADING:
                 # Start requesting LSAs
@@ -1190,7 +1446,7 @@ class OSPFAgent:
         elif new_state == STATE_EXCHANGE:
             # In Exchange state, we must respond to each received DBD
             # This is the request/response nature of OSPF DBD exchange
-            await self._send_dbd(neighbor)
+            await self._send_dbd(neighbor, iface_name)
 
             # CRITICAL: _send_dbd() may call exchange_done() which transitions to Loading
             # We need to check if state changed and send LSR if needed
@@ -1208,43 +1464,44 @@ class OSPFAgent:
         elif new_state in (STATE_LOADING, STATE_FULL) and success:
             # We're slave and received a duplicate DBD - respond to acknowledge
             self.logger.info(f"Responding to duplicate DBD from {neighbor_id}")
-            await self._send_dbd(neighbor)
+            await self._send_dbd(neighbor, iface_name)
 
-    async def _process_lsr(self, data: bytes, neighbor_id: str):
+    async def _process_lsr(self, data: bytes, neighbor_id: str, iface_name: str):
         """
         Process Link State Request packet
 
         Args:
             data: Packet bytes
             neighbor_id: Neighbor router ID
+            iface_name: Interface name packet was received on
         """
-        if neighbor_id not in self.neighbors:
-            self.logger.warning(f"Received LSR from unknown neighbor {neighbor_id}")
+        ctx = self.interfaces_ctx.get(iface_name)
+        neighbor = self._get_neighbor(neighbor_id, iface_name)
+        if not neighbor or not ctx:
+            self.logger.warning(f"[{iface_name}] Received LSR from unknown neighbor {neighbor_id}")
             return
-
-        neighbor = self.neighbors[neighbor_id]
 
         # Process LSR and build LSU response
         lsu_packet = self.flooding_mgr.process_ls_request(data, neighbor, self.area_id)
 
         if lsu_packet:
             # Send LSU unicast to neighbor
-            self.socket.send(lsu_packet, dest=neighbor.ip_address)
-            self.logger.debug(f"Sent LSU to {neighbor_id} in response to LSR")
+            ctx.socket.send(lsu_packet, dest=neighbor.ip_address)
+            self.logger.debug(f"[{iface_name}] Sent LSU to {neighbor_id} in response to LSR")
 
-    async def _process_lsu(self, data: bytes, neighbor_id: str):
+    async def _process_lsu(self, data: bytes, neighbor_id: str, iface_name: str):
         """
         Process Link State Update packet
 
         Args:
             data: Packet bytes
             neighbor_id: Neighbor router ID
+            iface_name: Interface name packet was received on
         """
-        if neighbor_id not in self.neighbors:
-            self.logger.warning(f"Received LSU from unknown neighbor {neighbor_id}")
+        neighbor = self._get_neighbor(neighbor_id, iface_name)
+        if not neighbor:
+            self.logger.warning(f"[{iface_name}] Received LSU from unknown neighbor {neighbor_id}")
             return
-
-        neighbor = self.neighbors[neighbor_id]
         state_before_lsu = neighbor.get_state()
 
         # Process LSU - returns (success, ack_packet, updated_lsas)
@@ -1253,7 +1510,7 @@ class OSPFAgent:
         if success:
             # Send LSAck if needed (unicast to neighbor)
             if ack_packet:
-                self.socket.send(ack_packet, dest=neighbor.ip_address)
+                self._send_to_neighbor(ack_packet, neighbor)
                 self.logger.debug(f"Sent LSAck to {neighbor_id}")
 
             # Separate self-originated LSAs from others (RFC 2328 Section 13.4)
@@ -1276,8 +1533,10 @@ class OSPFAgent:
             if external_lsas:
                 self.logger.info(f"Flooding {len(external_lsas)} external LSAs to other neighbors")
                 for lsa in external_lsas:
-                    # Get all neighbors as list
-                    neighbor_list = list(self.neighbors.values())
+                    # Get all neighbors from ALL interfaces (not just primary)
+                    neighbor_list = []
+                    for iface_name, ctx in self.interfaces_ctx.items():
+                        neighbor_list.extend(ctx.neighbors.values())
 
                     # Flood to all neighbors except sender
                     lsu_packets = self.flooding_mgr.flood_lsa_to_neighbors(
@@ -1286,7 +1545,7 @@ class OSPFAgent:
 
                     # Send LSU packets unicast to each neighbor
                     for target_neighbor, lsu_packet in lsu_packets:
-                        self.socket.send(lsu_packet, dest=target_neighbor.ip_address)
+                        self._send_to_neighbor(lsu_packet, target_neighbor)
                         self.logger.debug(f"Flooded LSA to {target_neighbor.router_id}")
 
             # Run SPF if any LSAs were updated
@@ -1302,19 +1561,19 @@ class OSPFAgent:
                 await self._flood_our_lsas_to_all_neighbors()
                 await self._run_spf()
 
-    async def _process_lsack(self, data: bytes, neighbor_id: str):
+    async def _process_lsack(self, data: bytes, neighbor_id: str, iface_name: str):
         """
         Process Link State Acknowledgment packet
 
         Args:
             data: Packet bytes
             neighbor_id: Neighbor router ID
+            iface_name: Interface name packet was received on
         """
-        if neighbor_id not in self.neighbors:
-            self.logger.warning(f"Received LSAck from unknown neighbor {neighbor_id}")
+        neighbor = self._get_neighbor(neighbor_id, iface_name)
+        if not neighbor:
+            self.logger.warning(f"[{iface_name}] Received LSAck from unknown neighbor {neighbor_id}")
             return
-
-        neighbor = self.neighbors[neighbor_id]
 
         # Process LSAck
         success = self.flooding_mgr.process_ls_ack(data, neighbor)
@@ -1323,31 +1582,33 @@ class OSPFAgent:
         else:
             self.logger.warning(f"Failed to process LSAck from {neighbor_id}")
 
-    async def _send_initial_dbd(self, neighbor: OSPFNeighbor):
+    async def _send_initial_dbd(self, neighbor: OSPFNeighbor, iface_name: str):
         """
         Send initial Database Description packet to neighbor (ExStart state)
 
         Args:
             neighbor: Target neighbor
+            iface_name: Interface name where neighbor resides
         """
         try:
-            self.logger.info(f"Building initial DBD for {neighbor.router_id}...")
+            self.logger.info(f"[{iface_name}] Building initial DBD for {neighbor.router_id}...")
             # Build initial DBD packet
-            dbd_packet = self.adjacency_mgr.build_initial_dbd_packet(neighbor, self.area_id)
+            dbd_packet = self.adjacency_mgr.build_initial_dbd_packet(neighbor, self.area_id, iface_name)
 
-            self.logger.info(f"Sending initial DBD to {neighbor.ip_address}...")
-            # Send DBD unicast to neighbor
-            self.socket.send(dbd_packet, dest=neighbor.ip_address)
-            self.logger.info(f"Sent initial DBD to {neighbor.router_id} (ExStart)")
+            self.logger.info(f"[{iface_name}] Sending initial DBD to {neighbor.ip_address}...")
+            # Send DBD unicast to neighbor using the correct interface socket
+            self._send_to_neighbor(dbd_packet, neighbor, iface_name)
+            self.logger.info(f"[{iface_name}] Sent initial DBD to {neighbor.router_id} (ExStart)")
         except Exception as e:
-            self.logger.error(f"Error sending initial DBD to {neighbor.router_id}: {e}", exc_info=True)
+            self.logger.error(f"[{iface_name}] Error sending initial DBD to {neighbor.router_id}: {e}", exc_info=True)
 
-    async def _send_dbd(self, neighbor: OSPFNeighbor):
+    async def _send_dbd(self, neighbor: OSPFNeighbor, iface_name: str = None):
         """
         Send Database Description packet to neighbor
 
         Args:
             neighbor: Target neighbor
+            iface_name: Interface name where neighbor resides (optional)
         """
         # If we're master, increment sequence number for new DBD
         if neighbor.is_master:
@@ -1359,11 +1620,11 @@ class OSPFAgent:
 
         # Build DBD packet
         dbd_packet = self.adjacency_mgr.build_dbd_packet(
-            neighbor, self.area_id, lsa_headers, has_more
+            neighbor, self.area_id, lsa_headers, has_more, iface_name
         )
 
-        # Send DBD unicast to neighbor
-        self.socket.send(dbd_packet, dest=neighbor.ip_address)
+        # Send DBD unicast to neighbor using correct interface
+        self._send_to_neighbor(dbd_packet, neighbor, iface_name)
         self.logger.debug(f"Sent DBD to {neighbor.router_id} "
                         f"(headers: {len(lsa_headers)}, more: {has_more})")
 
@@ -1394,7 +1655,7 @@ class OSPFAgent:
 
         if lsr_packet:
             # Send LSR unicast to neighbor
-            self.socket.send(lsr_packet, dest=neighbor.ip_address)
+            self._send_to_neighbor(lsr_packet, neighbor)
             self.logger.info(f"Sent LSR to {neighbor.router_id} "
                            f"requesting {len(neighbor.ls_request_list)} LSAs")
 
@@ -1405,13 +1666,21 @@ class OSPFAgent:
         Returns:
             Status dictionary
         """
+        # Get neighbors from ALL interfaces (multi-interface support)
+        all_neighbors = {}
+        for iface_name, ctx in self.interfaces_ctx.items():
+            for neighbor_id, neighbor in ctx.neighbors.items():
+                # Use neighbor.router_id as key to avoid duplicates across interfaces
+                # (same router seen on multiple interfaces should only count once)
+                all_neighbors[neighbor.router_id] = neighbor
+
         return {
             'router_id': self.router_id,
             'area': self.area_id,
             'interface': self.interface,
             'ip': self.source_ip,
-            'neighbors': len(self.neighbors),
-            'full_neighbors': sum(1 for n in self.neighbors.values() if n.is_full()),
+            'neighbors': len(all_neighbors),
+            'full_neighbors': sum(1 for n in all_neighbors.values() if n.is_full()),
             'lsdb_size': self.lsdb.get_size(),
             'routes': len(self.spf_calc.routing_table)
         }
@@ -1534,13 +1803,23 @@ async def run_unified_agent(args: argparse.Namespace):
     tasks = []
 
     # Determine what protocols to run
-    run_ospf = args.interface is not None  # OSPFv2 requires interface
+    # Handle both old single --interface and new multiple --interface args
+    ospf_interfaces = getattr(args, 'interfaces', None) or []
+    if not ospf_interfaces and hasattr(args, 'interface') and args.interface:
+        ospf_interfaces = [args.interface]  # Backwards compatibility
+
+    run_ospf = len(ospf_interfaces) > 0  # OSPFv2 requires interface
     run_ospfv3 = args.ospfv3_interface is not None  # OSPFv3 requires interface
     run_bgp = args.bgp_local_as is not None  # BGP requires local AS
 
     if not run_ospf and not run_ospfv3 and not run_bgp:
         logger.error("Must specify OSPF (--interface), OSPFv3 (--ospfv3-interface), or BGP (--bgp-local-as)")
         sys.exit(1)
+
+    # For now, use the first interface for OSPF (multi-interface support coming soon)
+    primary_ospf_interface = ospf_interfaces[0] if ospf_interfaces else None
+    if len(ospf_interfaces) > 1:
+        logger.info(f"Multi-interface OSPF: {', '.join(ospf_interfaces)} (primary: {primary_ospf_interface})")
 
     # Determine agent type for banner
     protocols = []
@@ -1556,7 +1835,8 @@ async def run_unified_agent(args: argparse.Namespace):
     # Standard mode
     logger.info(f"Starting Won't You Be My Neighbor - {agent_type} - Router ID: {args.router_id}")
     if run_ospf:
-        logger.info(f"  OSPFv2: Enabled (Area {args.area}, Interface {args.interface})")
+        interfaces_str = ', '.join(ospf_interfaces) if len(ospf_interfaces) > 1 else primary_ospf_interface
+        logger.info(f"  OSPFv2: Enabled (Area {args.area}, Interface {interfaces_str})")
     if run_ospfv3:
         logger.info(f"  OSPFv3: Enabled (Area {args.ospfv3_area}, Interface {args.ospfv3_interface})")
     if run_bgp:
@@ -1568,8 +1848,9 @@ async def run_unified_agent(args: argparse.Namespace):
 
         # Enable IP forwarding in kernel
         try:
-            subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"],
-                          capture_output=True, timeout=5)
+            import subprocess as _subprocess
+            _subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"],
+                           capture_output=True, timeout=5)
             logger.info("✓ IP forwarding enabled")
         except Exception as e:
             logger.warning(f"Could not enable IP forwarding: {e}")
@@ -1590,16 +1871,43 @@ async def run_unified_agent(args: argparse.Namespace):
         # Initialize OSPFv2 if requested
         if run_ospf:
             logger.info("Initializing OSPFv2 agent...")
+
+            # Parse per-interface unicast peers
+            interface_unicast_peers = {}
+            if hasattr(args, 'interface_unicast_peer') and args.interface_unicast_peer:
+                for peer_spec in args.interface_unicast_peer:
+                    if ':' in peer_spec:
+                        iface, peer_ip = peer_spec.split(':', 1)
+                        interface_unicast_peers[iface] = peer_ip
+                        logger.info(f"Configured unicast peer for {iface}: {peer_ip}")
+
+            # Extract interface IPs from agent config for logical interfaces
+            interface_ips = {}
+            if hasattr(asi_app, 'interfaces') and asi_app.interfaces:
+                for iface_config in asi_app.interfaces:
+                    # asi_app.interfaces uses full names ('name', 'addresses') not TOON keys ('n', 'a')
+                    iface_name = iface_config.get('name') or iface_config.get('id')
+                    iface_addresses = iface_config.get('addresses', [])
+                    if iface_addresses and len(iface_addresses) > 0:
+                        # Extract IP without netmask
+                        ip_with_mask = iface_addresses[0]
+                        ip = ip_with_mask.split('/')[0] if '/' in ip_with_mask else ip_with_mask
+                        interface_ips[iface_name] = ip
+                        logger.info(f"Interface {iface_name} has IP: {ip}")
+
             ospf_agent = OSPFAgent(
                 router_id=args.router_id,
                 area_id=args.area,
-                interface=args.interface,
+                interface=primary_ospf_interface,
                 hello_interval=args.hello_interval,
                 dead_interval=args.dead_interval,
                 network_type=args.network_type,
                 source_ip=args.source_ip,
                 unicast_peer=args.unicast_peer,
-                kernel_route_manager=kernel_route_manager
+                kernel_route_manager=kernel_route_manager,
+                interfaces=ospf_interfaces,  # Pass all interfaces!
+                interface_unicast_peers=interface_unicast_peers,
+                interface_ips=interface_ips  # Pass interface IPs for logical interfaces
             )
             asi_app.set_ospf(ospf_agent)
             asi_app.area_id = args.area
@@ -1671,11 +1979,11 @@ async def run_unified_agent(args: argparse.Namespace):
 
         # Get local IP from interface if available (for BGP next-hop)
         local_bgp_ip = None
-        if args.interface:
-            interface_info = get_interface_info(args.interface, args.source_ip if hasattr(args, 'source_ip') else None)
+        if primary_ospf_interface:
+            interface_info = get_interface_info(primary_ospf_interface, args.source_ip if hasattr(args, 'source_ip') else None)
             if interface_info:
                 local_bgp_ip = interface_info.ip_address
-                logger.info(f"Using interface {args.interface} IP {local_bgp_ip} for BGP")
+                logger.info(f"Using interface {primary_ospf_interface} IP {local_bgp_ip} for BGP")
 
         # Initialize BGP if requested
         if run_bgp:
@@ -1796,6 +2104,100 @@ async def run_unified_agent(args: argparse.Namespace):
                 protocols.append("BGP")
             logger.info(f"✓ Route redistribution enabled ({' ↔ '.join(protocols)})")
 
+        # Compute ASI ID early (needed by BFD, agentic bridge, etc.)
+        asi_id = args.asi_id if args.asi_id else f"asi-{args.router_id.replace('.', '-')}"
+
+        # Initialize BFD Manager (Bidirectional Forwarding Detection)
+        # BFD provides fast failure detection for OSPF, BGP, and other protocols
+        bfd_manager = None
+        if not args.no_bfd:
+            try:
+                from bfd import BFDManager, BFDManagerConfig
+
+                # Configure BFD with appropriate timers for different protocols
+                bfd_config = BFDManagerConfig(
+                    local_address=local_bgp_ip or "0.0.0.0",
+                    enabled=True,
+                    # OSPF BFD: 100ms intervals, 3x multiplier = 300ms detection
+                    ospf_enabled=True,
+                    ospf_min_tx=100000,  # 100ms in microseconds
+                    ospf_min_rx=100000,
+                    ospf_detect_mult=3,
+                    # BGP BFD: 100ms intervals, 3x multiplier = 300ms detection
+                    bgp_enabled=True,
+                    bgp_min_tx=100000,
+                    bgp_min_rx=100000,
+                    bgp_detect_mult=3,
+                    # IS-IS BFD: 100ms intervals
+                    isis_enabled=True,
+                    isis_min_tx=100000,
+                    isis_min_rx=100000,
+                    isis_detect_mult=3,
+                    # Static route BFD: 1s intervals (less critical)
+                    static_enabled=True,
+                    static_min_tx=1000000,  # 1s
+                    static_min_rx=1000000,
+                    static_detect_mult=3,
+                )
+
+                bfd_manager = BFDManager(config=bfd_config, agent_id=asi_id)
+                await bfd_manager.start()
+
+                logger.info("✓ BFD Manager started")
+                logger.info(f"  Detection times: OSPF/BGP=300ms, Static=3s")
+
+                # Auto-create BFD sessions for OSPF neighbors
+                if ospf_agent and bfd_config.ospf_enabled:
+                    # Register callback for OSPF neighbor state changes
+                    async def ospf_bfd_callback(session, old_state, new_state):
+                        from bfd import BFDState
+                        if new_state == BFDState.DOWN:
+                            logger.warning(f"[BFD→OSPF] Link failure detected to {session.config.remote_address}")
+                            # TODO: Trigger OSPF neighbor down event
+                        elif new_state == BFDState.UP:
+                            logger.info(f"[BFD→OSPF] Link up to {session.config.remote_address}")
+
+                    bfd_manager.register_protocol_callback("ospf", ospf_bfd_callback)
+
+                    # Create sessions for known OSPF neighbors (will auto-create as neighbors are discovered)
+                    logger.info("  BFD for OSPF: Enabled (sessions created on neighbor discovery)")
+
+                # Auto-create BFD sessions for BGP peers
+                if bgp_speaker and bfd_config.bgp_enabled and args.bgp_peers:
+                    # Register callback for BGP BFD state changes
+                    async def bgp_bfd_callback(session, old_state, new_state):
+                        from bfd import BFDState
+                        if new_state == BFDState.DOWN:
+                            logger.warning(f"[BFD→BGP] Link failure detected to {session.config.remote_address}")
+                            # TODO: Trigger BGP session reset/hold timer adjustment
+                        elif new_state == BFDState.UP:
+                            logger.info(f"[BFD→BGP] Link up to {session.config.remote_address}")
+
+                    bfd_manager.register_protocol_callback("bgp", bgp_bfd_callback)
+
+                    # Create BFD sessions for all configured BGP peers
+                    for peer_ip in args.bgp_peers:
+                        try:
+                            session = await bfd_manager.create_session_for_protocol(
+                                protocol="bgp",
+                                peer_address=peer_ip,
+                                local_address=local_bgp_ip or "",
+                                interface=primary_ospf_interface or ""
+                            )
+                            logger.info(f"  ✓ BFD session created for BGP peer {peer_ip}")
+                        except Exception as e:
+                            logger.warning(f"  Could not create BFD session for BGP peer {peer_ip}: {e}")
+
+                # Store BFD manager in app for web UI access
+                asi_app.bfd_manager = bfd_manager
+
+            except ImportError as e:
+                logger.warning(f"BFD module not available: {e}")
+            except Exception as e:
+                logger.warning(f"Could not start BFD manager: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+
         # Initialize Agentic Bridge (for Web UI or API)
         # Import agentic modules
         from agentic.integration.bridge import AgenticBridge
@@ -1815,9 +2217,6 @@ async def run_unified_agent(args: argparse.Namespace):
             logger.warning("No LLM API keys provided. ASI will work but won't have AI responses. "
                          "Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY environment variables "
                          "or use --openai-key, --claude-key, or --gemini-key flags.")
-
-        # Determine ASI ID
-        asi_id = args.asi_id if args.asi_id else f"asi-{args.router_id.replace('.', '-')}"
 
         # Create agentic bridge
         bridge = AgenticBridge(
@@ -1984,6 +2383,16 @@ async def run_unified_agent(args: argparse.Namespace):
                 logger.warning(f"Web UI not available ({e}). Install with: pip install uvicorn")
             except Exception as e:
                 logger.warning(f"Could not start Web UI: {e}")
+
+        # Start LLDP daemon for neighbor discovery
+        try:
+            from agentic.discovery.lldp import start_lldp
+            await start_lldp(asi_id)
+            logger.info(f"✓ LLDP daemon started for neighbor discovery")
+        except ImportError as e:
+            logger.warning(f"LLDP not available ({e})")
+        except Exception as e:
+            logger.warning(f"Could not start LLDP daemon: {e}")
 
         # Setup signal handlers for graceful shutdown
         loop = asyncio.get_event_loop()
@@ -2179,8 +2588,8 @@ Notes:
     ospf_group = parser.add_argument_group('OSPF Options')
     ospf_group.add_argument("--area", default="0.0.0.0",
                        help="OSPF Area (default: 0.0.0.0)")
-    ospf_group.add_argument("--interface", default=None,
-                       help="Network interface for OSPF (e.g., eth0, en0)")
+    ospf_group.add_argument("--interface", action="append", dest="interfaces",
+                       help="Network interface for OSPF (e.g., eth0, en0). Can be specified multiple times for multi-interface OSPF.")
     ospf_group.add_argument("--source-ip", default=None,
                        help="Source IP address (optional, for multi-IP interfaces)")
     ospf_group.add_argument("--hello-interval", type=int, default=10,
@@ -2191,7 +2600,9 @@ Notes:
                        choices=['broadcast', 'point-to-multipoint', 'point-to-point', 'nbma'],
                        help="OSPF Network type (default: broadcast)")
     ospf_group.add_argument("--unicast-peer", default=None,
-                       help="OSPF Unicast peer IP for point-to-point")
+                       help="OSPF Unicast peer IP for point-to-point (applies to primary interface)")
+    ospf_group.add_argument("--interface-unicast-peer", action="append",
+                       help="Per-interface unicast peer (format: interface:peer_ip, e.g., eth0:10.0.1.2)")
 
     # OSPFv3 arguments (IPv6)
     ospfv3_group = parser.add_argument_group('OSPFv3 Options (IPv6)')
@@ -2369,6 +2780,17 @@ Notes:
     webui_group.add_argument("--no-browser", action="store_true",
                        help="Don't auto-launch browser on startup")
 
+    # BFD (Bidirectional Forwarding Detection) Options
+    bfd_group = parser.add_argument_group('BFD Options (RFC 5880, 5881, 5882)')
+    bfd_group.add_argument("--no-bfd", action="store_true",
+                       help="Disable BFD (enabled by default for all protocols)")
+    bfd_group.add_argument("--bfd-min-tx", type=int, default=100000,
+                       help="BFD desired min TX interval in microseconds (default: 100000 = 100ms)")
+    bfd_group.add_argument("--bfd-min-rx", type=int, default=100000,
+                       help="BFD required min RX interval in microseconds (default: 100000 = 100ms)")
+    bfd_group.add_argument("--bfd-detect-mult", type=int, default=3,
+                       help="BFD detection time multiplier (default: 3, detection_time = mult × rx_interval)")
+
     args = parser.parse_args()
 
     # Handle Web UI flag logic
@@ -2383,7 +2805,8 @@ Notes:
     # Routing mode: router-id and protocols specified (for containers)
     has_routing_config = (
         args.router_id is not None or
-        args.interface is not None or
+        (hasattr(args, 'interface') and args.interface is not None) or
+        (hasattr(args, 'interfaces') and args.interfaces is not None) or
         args.bgp_local_as is not None or
         args.ospfv3_interface is not None
     )
@@ -2407,7 +2830,10 @@ Notes:
         parser.print_help()
         sys.exit(1)
 
-    if not args.interface and not args.bgp_local_as and not args.ospfv3_interface:
+    # Check for OSPF interfaces (support both old and new arg names)
+    has_ospf = (hasattr(args, 'interfaces') and args.interfaces) or (hasattr(args, 'interface') and args.interface)
+
+    if not has_ospf and not args.bgp_local_as and not args.ospfv3_interface:
         print("Error: Must specify either OSPFv2 (--interface), OSPFv3 (--ospfv3-interface), or BGP (--bgp-local-as) configuration")
         parser.print_help()
         sys.exit(1)

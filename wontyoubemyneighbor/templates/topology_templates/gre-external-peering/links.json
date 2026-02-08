@@ -1,22 +1,20 @@
 [
   {
     "id": "link-edge-core",
-    "agent1": "edge-router",
-    "if1": "eth0",
-    "agent2": "core-router",
-    "if2": "eth0",
-    "subnet": "172.20.0.0/24",
-    "cost": 10,
-    "description": "Edge to Core link"
+    "a1": "edge-router",
+    "i1": "eth0",
+    "a2": "core-router",
+    "i2": "eth0",
+    "t": "ethernet",
+    "c": 10
   },
   {
     "id": "link-core-internal",
-    "agent1": "core-router",
-    "if1": "eth1",
-    "agent2": "internal-router",
-    "if2": "eth0",
-    "subnet": "172.20.1.0/24",
-    "cost": 10,
-    "description": "Core to Internal link"
+    "a1": "core-router",
+    "i1": "eth2",
+    "a2": "internal-router",
+    "i2": "eth0",
+    "t": "ethernet",
+    "c": 10
   }
 ]

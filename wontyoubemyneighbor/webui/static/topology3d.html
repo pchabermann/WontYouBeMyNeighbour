@@ -1047,10 +1047,29 @@
                     const status = await statusResponse.json();
 
                     if (status.router_id === node.id || status.agent_name === node.name) {
+                        // Detect active protocols from status
+                        let protocols = [];
+                        if (status.ospf && status.ospf.neighbors > 0) {
+                            protocols.push('ospf');
+                        }
+                        if (status.bgp && status.bgp.total_peers > 0) {
+                            protocols.push('bgp');
+                        }
+                        if (status.ospfv3) {
+                            protocols.push('ospfv3');
+                        }
+                        // Default if no protocols detected
+                        if (protocols.length === 0 && node.protocols && node.protocols.length > 0) {
+                            protocols = node.protocols; // Keep existing
+                        } else if (protocols.length === 0) {
+                            protocols = ['deployed'];
+                        }
+
                         freshData = {
                             neighbors: (status.ospf?.neighbors || 0) + (status.bgp?.total_peers || 0),
                             routes: (status.ospf?.routes || 0) + (status.bgp?.loc_rib_routes || 0),
                             status: status.running ? 'running' : 'stopped',
+                            protocols: protocols,
                             protocolStatus: {}
                         };
 
@@ -1079,6 +1098,9 @@
                     node.neighbors = freshData.neighbors;
                     node.routes = freshData.routes;
                     node.status = freshData.status;
+                    if (freshData.protocols) {
+                        node.protocols = freshData.protocols;
+                    }
                     if (freshData.protocolStatus) {
                         node.protocolStatus = freshData.protocolStatus;
                     }

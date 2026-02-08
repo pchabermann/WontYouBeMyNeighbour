@@ -476,6 +476,26 @@ async def init_prometheus_for_agent(agent_id: str, router_id: str) -> Prometheus
     return exporter
 
 
+def register_gre_metrics(exporter: PrometheusExporter) -> None:
+    """
+    Register GRE tunnel metrics for an agent.
+    Only call this if the agent has GRE interfaces configured.
+    """
+    exporter.register_gauge("gre_tunnels_total", "Total number of GRE tunnels")
+    exporter.register_gauge("gre_tunnels_up", "Number of GRE tunnels in UP state")
+    exporter.register_counter("gre_tx_packets_total", "Total packets transmitted through GRE tunnels")
+    exporter.register_counter("gre_rx_packets_total", "Total packets received through GRE tunnels")
+    exporter.register_counter("gre_tx_bytes_total", "Total bytes transmitted through GRE tunnels")
+    exporter.register_counter("gre_rx_bytes_total", "Total bytes received through GRE tunnels")
+    exporter.register_counter("gre_tx_errors_total", "Total transmit errors on GRE tunnels")
+    exporter.register_counter("gre_rx_errors_total", "Total receive errors on GRE tunnels")
+    exporter.register_gauge("gre_tunnel_mtu", "MTU of GRE tunnel")
+    exporter.register_gauge("gre_tunnel_state", "State of GRE tunnel (1=up, 0=down)")
+    exporter.register_counter("gre_keepalive_sent_total", "Total GRE keepalive packets sent")
+    exporter.register_counter("gre_keepalive_recv_total", "Total GRE keepalive packets received")
+    logger.info(f"GRE metrics registered for agent {exporter.agent_id}")
+
+
 # Standard metric collectors that can be added to exporters
 
 async def collect_system_metrics(exporter: PrometheusExporter) -> None:
@@ -517,3 +537,96 @@ async def collect_interface_metrics(exporter: PrometheusExporter) -> None:
         exporter.set_gauge("interface_tx_bytes_total", 0.0, {"interface": "eth0"})
     except Exception as e:
         logger.warning(f"Interface metrics collection failed: {e}")
+
+
+async def collect_gre_metrics(exporter: PrometheusExporter) -> None:
+    """Collect GRE tunnel metrics"""
+    try:
+        from gre import get_gre_manager
+        agent_id = exporter.agent_id
+        manager = get_gre_manager(agent_id)
+
+        if not manager:
+            # No GRE manager for this agent
+            return
+
+        tunnels = manager.get_tunnels()
+        if not tunnels:
+            return
+
+        total_tunnels = len(tunnels)
+        tunnels_up = sum(1 for t in tunnels if t.is_up)
+
+        exporter.set_gauge("gre_tunnels_total", float(total_tunnels))
+        exporter.set_gauge("gre_tunnels_up", float(tunnels_up))
+
+        # Collect per-tunnel metrics
+        total_tx_packets = 0
+        total_rx_packets = 0
+        total_tx_bytes = 0
+        total_rx_bytes = 0
+        total_tx_errors = 0
+        total_rx_errors = 0
+        total_keepalive_sent = 0
+        total_keepalive_recv = 0
+
+        for tunnel in tunnels:
+            labels = {
+                "tunnel_name": tunnel.name,
+                "local_ip": tunnel.config.local_ip,
+                "remote_ip": tunnel.config.remote_ip
+            }
+
+            stats = tunnel.stats.to_dict() if hasattr(tunnel, 'stats') else {}
+
+            # Per-tunnel metrics
+            tx_packets = float(stats.get('packets_tx', 0))
+            rx_packets = float(stats.get('packets_rx', 0))
+            tx_bytes = float(stats.get('bytes_tx', 0))
+            rx_bytes = float(stats.get('bytes_rx', 0))
+            tx_errors = float(stats.get('packets_dropped', 0))
+            rx_errors = float(stats.get('checksum_errors', 0))
+
+            exporter.set_gauge("gre_tx_packets_total", tx_packets, labels)
+            exporter.set_gauge("gre_rx_packets_total", rx_packets, labels)
+            exporter.set_gauge("gre_tx_bytes_total", tx_bytes, labels)
+            exporter.set_gauge("gre_rx_bytes_total", rx_bytes, labels)
+            exporter.set_gauge("gre_tx_errors_total", tx_errors, labels)
+            exporter.set_gauge("gre_rx_errors_total", rx_errors, labels)
+
+            exporter.set_gauge("gre_tunnel_mtu", float(tunnel.config.mtu), labels)
+            exporter.set_gauge("gre_tunnel_state", 1.0 if tunnel.is_up else 0.0, labels)
+
+            # Keepalive metrics from tunnel stats
+            ka_sent = float(stats.get('keepalive_tx', 0))
+            ka_recv = float(stats.get('keepalive_rx', 0))
+
+            exporter.set_gauge("gre_keepalive_sent_total", ka_sent, labels)
+            exporter.set_gauge("gre_keepalive_recv_total", ka_recv, labels)
+
+            # Aggregate totals
+            total_tx_packets += tx_packets
+            total_rx_packets += rx_packets
+            total_tx_bytes += tx_bytes
+            total_rx_bytes += rx_bytes
+            total_tx_errors += tx_errors
+            total_rx_errors += rx_errors
+            total_keepalive_sent += ka_sent
+            total_keepalive_recv += ka_recv
+
+        # Set aggregate metrics (no labels = all tunnels combined)
+        exporter.set_gauge("gre_tx_packets_total", total_tx_packets)
+        exporter.set_gauge("gre_rx_packets_total", total_rx_packets)
+        exporter.set_gauge("gre_tx_bytes_total", total_tx_bytes)
+        exporter.set_gauge("gre_rx_bytes_total", total_rx_bytes)
+        exporter.set_gauge("gre_tx_errors_total", total_tx_errors)
+        exporter.set_gauge("gre_rx_errors_total", total_rx_errors)
+        exporter.set_gauge("gre_keepalive_sent_total", total_keepalive_sent)
+        exporter.set_gauge("gre_keepalive_recv_total", total_keepalive_recv)
+
+        logger.debug(f"Collected GRE metrics for {exporter.agent_id}: {total_tunnels} tunnels, {tunnels_up} up")
+    except ImportError:
+        # GRE module not available
+        pass
+    except Exception as e:
+        logger.warning(f"GRE metrics collection failed: {e}")

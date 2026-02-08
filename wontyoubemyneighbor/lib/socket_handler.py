@@ -45,9 +45,23 @@ class OSPFSocket:
             # Set socket options
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-            # Bind to INADDR_ANY to receive multicast packets
-            # We still set IP_MULTICAST_IF below to send from the correct interface
-            self.sock.bind(('', 0))
+            # Bind socket to specific interface to prevent multicast leak
+            # SO_BINDTODEVICE ensures we only receive packets from this interface
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                                   (self.interface + '\0').encode('utf-8'))
+                logger.info(f"Bound socket to interface {self.interface}")
+            except AttributeError:
+                # SO_BINDTODEVICE might not be available on all platforms
+                logger.warning(f"SO_BINDTODEVICE not available, multicast may leak between interfaces")
+            except Exception as e:
+                logger.error(f"Failed to bind to interface {self.interface}: {e}")
+
+            # RFC 2328: For raw OSPF sockets, bind to INADDR_ANY to receive multicast
+            # SO_BINDTODEVICE (above) ensures we only receive from this interface
+            # Binding to a specific IP would prevent multicast reception on raw sockets
+            self.sock.bind(('0.0.0.0', 0))
+            logger.info(f"Bound socket to INADDR_ANY for interface {self.interface} (source: {self.source_ip})")
 
             # Set TTL for unicast packets (needed for point-to-point unicast neighbors)
             self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, OSPF_UNICAST_TTL)

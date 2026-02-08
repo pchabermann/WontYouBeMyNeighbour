@@ -194,6 +194,7 @@ class LSAFloodingManager:
 
                     # Remove from neighbor's request list if present
                     if neighbor.get_state() == STATE_LOADING:
+                        old_len = len(neighbor.ls_request_list)
                         # Check if this LSA was in our request list
                         neighbor.ls_request_list = [
                             h for h in neighbor.ls_request_list
@@ -201,15 +202,23 @@ class LSAFloodingManager:
                                    h.link_state_id == lsa.header.link_state_id and
                                    h.advertising_router == lsa.header.advertising_router)
                         ]
+                        new_len = len(neighbor.ls_request_list)
+                        if old_len != new_len:
+                            logger.info(f"Removed LSA from request list: {lsa.header.ls_type}/{lsa.header.link_state_id}/{lsa.header.advertising_router}. List size: {old_len} → {new_len}")
+                        else:
+                            logger.info(f"LSA not in request list: {lsa.header.ls_type}/{lsa.header.link_state_id}/{lsa.header.advertising_router}. List size still: {new_len}")
 
                 except Exception as e:
                     logger.error(f"Error processing LSA from {neighbor.router_id}: {e}")
 
             # Check if this completes loading state
             if neighbor.get_state() == STATE_LOADING:
+                logger.info(f"Neighbor {neighbor.router_id} still in Loading state. Request list has {len(neighbor.ls_request_list)} LSAs remaining")
                 if len(neighbor.ls_request_list) == 0:
-                    logger.info(f"Loading complete for {neighbor.router_id}")
+                    logger.info(f"Loading complete for {neighbor.router_id} - request list empty!")
                     neighbor.loading_done()
+                else:
+                    logger.info(f"Still waiting for {len(neighbor.ls_request_list)} LSAs from {neighbor.router_id}")
 
             # Return updated LSAs for flooding to other neighbors
             logger.info(f"Processed {len(updated_lsas)} new/updated LSAs from {neighbor.router_id}")
@@ -569,7 +578,7 @@ class LSAFloodingManager:
                                 logger.debug(f"Parsed Router LSA from {lsa_header.advertising_router}, "
                                            f"num_links field={num_links}, actual links parsed={actual_links}")
                                 if num_links != actual_links:
-                                    logger.warning(f"Link count mismatch! Expected {num_links}, parsed {actual_links}")
+                                    logger.debug(f"Link count mismatch: header says {num_links}, parsed {actual_links}")
                                 if actual_links > 0:
                                     for i, link in enumerate(body.links):
                                         logger.debug(f"  Link {i}: type={link.link_type}, id={link.link_id}, "

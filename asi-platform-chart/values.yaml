@@ -1,0 +1,242 @@
+# Default values for ASI Platform
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# ============================================================================
+# Global Configuration
+# ============================================================================
+global:
+  # Image registry for all ASI components
+  imageRegistry: localhost:5000
+
+  # Image pull policy
+  imagePullPolicy: Always
+
+  # Image pull secrets (if using private registry)
+  imagePullSecrets: []
+  # - name: regcred
+
+# ============================================================================
+# ASI Controller
+# ============================================================================
+controller:
+  enabled: true
+
+  # Number of controller replicas
+  replicaCount: 1
+
+  image:
+    repository: asi-controller
+    tag: latest
+    pullPolicy: Always
+
+  # Resources for controller
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # Service account
+  serviceAccount:
+    create: true
+    annotations: {}
+    name: "asi-controller"
+
+  # RBAC
+  rbac:
+    create: true
+
+  # Node selector
+  nodeSelector: {}
+
+  # Tolerations
+  tolerations: []
+
+  # Affinity
+  affinity: {}
+
+  # Metrics
+  metrics:
+    enabled: true
+    port: 8080
+    serviceMonitor:
+      enabled: false
+
+# ============================================================================
+# Wizard Service
+# ============================================================================
+wizard:
+  enabled: true
+
+  # Number of wizard replicas
+  replicaCount: 1
+
+  image:
+    repository: asi-wizard
+    tag: latest
+    pullPolicy: Always
+
+  # Resources
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # Service
+  service:
+    type: LoadBalancer
+    port: 80
+    targetPort: 8000
+    nodePort: 30080  # Only used when type is NodePort
+    annotations: {}
+    # cloud.google.com/load-balancer-type: "Internal"
+
+  # Ingress
+  ingress:
+    enabled: false
+    className: nginx
+    annotations: {}
+      # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    hosts:
+      - host: wizard.asi.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+    # - secretName: wizard-tls
+    #   hosts:
+    #     - wizard.asi.example.com
+
+  # Service account
+  serviceAccount:
+    create: true
+    annotations: {}
+    name: "asi-wizard"
+
+  # RBAC
+  rbac:
+    create: true
+
+# ============================================================================
+# Agent Image Configuration
+# ============================================================================
+agent:
+  # Default agent image used by AgentTopology CRs
+  image:
+    repository: asi-agent
+    tag: latest
+    pullPolicy: Always
+
+  # Default resources for agent pods
+  defaultResources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+
+  # Security context for agent pods
+  securityContext:
+    capabilities:
+      add:
+        - NET_ADMIN
+        - NET_RAW
+
+# ============================================================================
+# Observability Stack
+# ============================================================================
+observability:
+  # Create observability namespace
+  namespace: asi-observability
+
+  # Prometheus
+  prometheus:
+    enabled: false  # Set to true to deploy Prometheus
+    # If using kube-prometheus-stack dependency, most config is inherited
+
+  # Grafana
+  grafana:
+    enabled: false  # Set to true to deploy Grafana
+    adminPassword: "admin"  # CHANGE THIS IN PRODUCTION
+
+  # Loki (log aggregation)
+  loki:
+    enabled: false
+
+  # Jaeger (distributed tracing)
+  jaeger:
+    enabled: false
+
+# ============================================================================
+# Storage
+# ============================================================================
+storage:
+  # Storage class for agent PVCs
+  storageClassName: standard
+
+  # Rook-Ceph integration
+  rook:
+    enabled: false
+    # If enabled, will use Rook-Ceph for storage
+
+# ============================================================================
+# Networking
+# ============================================================================
+networking:
+  # Multus CNI
+  multus:
+    enabled: false  # Set to true if Multus CNI is installed
+
+  # Istio service mesh
+  istio:
+    enabled: false  # Set to true if Istio is installed
+    # Istio only applies to agent overlay network (fd00::/64)
+    # NOT to Kubernetes underlay infrastructure
+
+# ============================================================================
+# Custom Resource Definitions
+# ============================================================================
+crds:
+  # Install AgentTopology CRD
+  install: true
+
+  # Keep CRDs on chart uninstall (recommended)
+  keep: true
+
+# ============================================================================
+# Sample Topologies
+# ============================================================================
+samples:
+  # Deploy sample AgentTopology CRs
+  enabled: false
+
+  # List of sample topologies to deploy
+  topologies:
+    - name: gre-external-peering
+      enabled: false
+
+# ============================================================================
+# Advanced Configuration
+# ============================================================================
+
+# Additional labels for all resources
+commonLabels: {}
+  # environment: production
+  # team: networking
+
+# Additional annotations for all resources
+commonAnnotations: {}
+
+# Priority class for pods
+priorityClassName: ""
+
+# Pod security policy
+podSecurityPolicy:
+  enabled: false

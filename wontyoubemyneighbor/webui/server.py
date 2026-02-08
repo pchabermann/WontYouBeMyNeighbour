@@ -175,7 +175,8 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
         # Start Prometheus metrics collection
         try:
             from agentic.mcp.prometheus_mcp import (
-                get_prometheus_client, collect_system_metrics, collect_interface_metrics
+                get_prometheus_client, collect_system_metrics, collect_interface_metrics,
+                collect_gre_metrics, register_gre_metrics
             )
             import asyncio
 
@@ -185,12 +186,20 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
             router_id = os.environ.get("ASI_ROUTER_ID", "10.255.255.1")
             exporter = prometheus.create_exporter(agent_id, router_id)
 
+            # Register GRE metrics only if agent has GRE interfaces
+            if asi_app and hasattr(asi_app, 'gre_tunnels') and asi_app.gre_tunnels:
+                register_gre_metrics(exporter)
+                logger.info(f"GRE metrics enabled for agent {agent_id}")
+            else:
+                logger.debug(f"GRE metrics disabled for agent {agent_id} (no GRE interfaces)")
+
             # Background task to collect metrics every 10 seconds
             async def metrics_collector():
                 while True:
                     try:
                         await collect_system_metrics(exporter)
                         await collect_interface_metrics(exporter)
+                        await collect_gre_metrics(exporter)
 
                         # Record OSPF metrics from actual protocol state
                         ospf_neighbors = 0
@@ -503,7 +512,7 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
 
         # Collect interface information from multiple sources
         def add_interface(iface):
-            status["interfaces"].append({
+            iface_data = {
                 "id": iface.get('id') or iface.get('n'),
                 "name": iface.get('n') or iface.get('name'),
                 "type": iface.get('t') or iface.get('type', 'eth'),
@@ -511,7 +520,11 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
                 "status": iface.get('s') or iface.get('status', 'up'),
                 "mtu": iface.get('mtu', 1500),
                 "description": iface.get('description', '')
-            })
+            }
+            # Include tunnel configuration if present (for GRE interfaces)
+            if 'tun' in iface:
+                iface_data['tun'] = iface['tun']
+            status["interfaces"].append(iface_data)
 
         # Source 1: asi_app.interfaces
         if hasattr(asi_app, 'interfaces') and asi_app.interfaces:
@@ -543,22 +556,33 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
         # OSPF status
         if asi_app.ospf_interface:
             ospf = asi_app.ospf_interface
+
+            # Get neighbors from ALL interfaces (multi-interface support)
+            all_neighbors = {}
+            for iface_name, ctx in ospf.interfaces_ctx.items():
+                for neighbor_id, neighbor in ctx.neighbors.items():
+                    # Use neighbor.router_id as key to deduplicate across interfaces
+                    # Keep the first interface where we saw this neighbor
+                    if neighbor.router_id not in all_neighbors:
+                        all_neighbors[neighbor.router_id] = (neighbor, iface_name)
+
             status["ospf"] = {
                 "area": ospf.area_id,
                 "interface": ospf.interface,
                 "ip": ospf.source_ip,
-                "neighbors": len(ospf.neighbors),
-                "full_neighbors": sum(1 for n in ospf.neighbors.values() if n.is_full()),
+                "neighbors": len(all_neighbors),
+                "full_neighbors": sum(1 for (n, _) in all_neighbors.values() if n.is_full()),
                 "lsdb_size": ospf.lsdb.get_size(),
                 "routes": len(ospf.spf_calc.routing_table),
                 "neighbor_details": [
                     {
                         "router_id": n.router_id,
                         "ip": n.ip_address,
+                        "interface": iface,
                         "state": n.get_state_name(),
                         "is_full": n.is_full()
                     }
-                    for n in ospf.neighbors.values()
+                    for (n, iface) in all_neighbors.values()
                 ]
             }
 
@@ -721,7 +745,478 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
         except Exception:
             pass
 
+        # GRE Tunnel status - RFC 2784/2890
+        try:
+            from gre import get_gre_manager
+            gre_agent_id = os.environ.get("ASI_AGENT_ID", "local")
+            manager = get_gre_manager(gre_agent_id)
+            if manager:
+                status["gre"] = {
+                    "enabled": True,
+                    "tunnel_count": manager.tunnel_count,
+                    "tunnels": manager.list_tunnels()
+                }
+            # No warning if GRE not configured - it's optional
+        except ImportError as e:
+            logging.getLogger("WebUI").warning(f"GRE import error: {e}")
+        except Exception as e:
+            logging.getLogger("WebUI").error(f"GRE status error: {e}", exc_info=True)
+
         return status
+
+    @app.get("/api/openapi.json")
+    async def get_openapi_spec() -> Dict[str, Any]:
+        """
+        Generate OpenAPI 3.0 specification for this agent's REST API.
+        Provides live, interactive documentation via Swagger UI.
+        """
+        import os
+
+        # Get agent details
+        agent_name = os.environ.get('ASI_AGENT_NAME', 'Unknown Agent')
+        router_id = asi_app.router_id
+        container_name = os.environ.get('CONTAINER_NAME', 'unknown')
+
+        # Determine base URL
+        base_url = f"http://localhost:8888"
+
+        spec = {
+            "openapi": "3.0.0",
+            "info": {
+                "title": f"{agent_name} REST API",
+                "version": "1.0.0",
+                "description": f"""
+# {agent_name} - Autonomous Network Agent
+
+This agent is part of the **Won't You Be My Neighbor** autonomous networking system.
+
+**Router ID:** `{router_id}`
+**Container:** `{container_name}`
+
+## Features
+- Real-time protocol state (OSPF, BGP, IS-IS, BFD, GRE, EVPN)
+- Interface management and monitoring
+- Agentic conversation interface (Claude integration)
+- WebSocket streaming for logs and chat
+- MCP (Model Context Protocol) servers for LLM tool use
+- pyATS testing integration
+
+## Authentication
+Currently no authentication required for localhost access. For production deployments, implement token-based authentication.
+                """,
+                "contact": {
+                    "name": "WYBNMN Project",
+                    "url": "https://github.com/automateyournetwork/wontyoubemyneighbor"
+                }
+            },
+            "servers": [
+                {
+                    "url": base_url,
+                    "description": "Agent Web UI Server"
+                }
+            ],
+            "paths": {
+                "/api/status": {
+                    "get": {
+                        "summary": "Get agent status",
+                        "description": "Returns comprehensive agent status including router ID, running state, interfaces, protocols, and MCP servers",
+                        "tags": ["Core"],
+                        "responses": {
+                            "200": {
+                                "description": "Agent status",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "agent_name": {"type": "string"},
+                                                "router_id": {"type": "string"},
+                                                "running": {"type": "boolean"},
+                                                "interfaces": {"type": "array"},
+                                                "ospf": {"type": "object"},
+                                                "bgp": {"type": "object"},
+                                                "mcps": {"type": "array"}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "/api/interfaces": {
+                    "get": {
+                        "summary": "Get all interfaces",
+                        "description": "Returns detailed information about all configured network interfaces",
+                        "tags": ["Interfaces"],
+                        "responses": {
+                            "200": {
+                                "description": "Interface list",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "interfaces": {
+                                                    "type": "array",
+                                                    "items": {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "name": {"type": "string"},
+                                                            "type": {"type": "string"},
+                                                            "addresses": {"type": "array"},
+                                                            "status": {"type": "string"},
+                                                            "mtu": {"type": "integer"}
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "/api/ospf/neighbors": {
+                    "get": {
+                        "summary": "Get OSPF neighbors",
+                        "description": "Returns all OSPF neighbor adjacencies with state and statistics",
+                        "tags": ["OSPF"],
+                        "responses": {
+                            "200": {
+                                "description": "OSPF neighbor list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/ospf/routes": {
+                    "get": {
+                        "summary": "Get OSPF routes",
+                        "description": "Returns OSPF routing table calculated via SPF",
+                        "tags": ["OSPF"],
+                        "responses": {
+                            "200": {
+                                "description": "OSPF routing table",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/ospf/lsdb": {
+                    "get": {
+                        "summary": "Get OSPF LSDB",
+                        "description": "Returns Link State Database (all LSAs)",
+                        "tags": ["OSPF"],
+                        "responses": {
+                            "200": {
+                                "description": "OSPF LSDB",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/bgp/neighbors": {
+                    "get": {
+                        "summary": "Get BGP neighbors",
+                        "description": "Returns all BGP peer sessions with state and capabilities",
+                        "tags": ["BGP"],
+                        "responses": {
+                            "200": {
+                                "description": "BGP neighbor list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/bgp/routes": {
+                    "get": {
+                        "summary": "Get BGP routes",
+                        "description": "Returns BGP RIB (Routing Information Base)",
+                        "tags": ["BGP"],
+                        "responses": {
+                            "200": {
+                                "description": "BGP routing table",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/isis/neighbors": {
+                    "get": {
+                        "summary": "Get IS-IS adjacencies",
+                        "description": "Returns IS-IS neighbor adjacencies",
+                        "tags": ["IS-IS"],
+                        "responses": {
+                            "200": {
+                                "description": "IS-IS neighbor list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/bfd/sessions": {
+                    "get": {
+                        "summary": "Get BFD sessions",
+                        "description": "Returns Bidirectional Forwarding Detection session states",
+                        "tags": ["BFD"],
+                        "responses": {
+                            "200": {
+                                "description": "BFD session list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/gre/tunnels": {
+                    "get": {
+                        "summary": "Get GRE tunnels",
+                        "description": "Returns Generic Routing Encapsulation tunnel status",
+                        "tags": ["GRE"],
+                        "responses": {
+                            "200": {
+                                "description": "GRE tunnel list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/evpn/routes": {
+                    "get": {
+                        "summary": "Get EVPN routes",
+                        "description": "Returns EVPN (Ethernet VPN) route table",
+                        "tags": ["EVPN"],
+                        "responses": {
+                            "200": {
+                                "description": "EVPN route list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/lldp/neighbors": {
+                    "get": {
+                        "summary": "Get LLDP neighbors",
+                        "description": "Returns Layer 2 LLDP discovered neighbors",
+                        "tags": ["LLDP"],
+                        "responses": {
+                            "200": {
+                                "description": "LLDP neighbor list",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/chat": {
+                    "post": {
+                        "summary": "Send chat message to agent",
+                        "description": "Send a message to the agentic conversation interface (Claude integration)",
+                        "tags": ["Agentic"],
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "message": {
+                                                "type": "string",
+                                                "description": "Message to send to the agent"
+                                            }
+                                        },
+                                        "required": ["message"]
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "Chat response",
+                                "content": {"application/json": {}}
+                            }
+                        }
+                    }
+                },
+                "/api/mcp/servers": {
+                    "get": {
+                        "summary": "Get MCP servers",
+                        "description": "Returns enabled Model Context Protocol servers with their tools and connection info",
+                        "tags": ["MCP"],
+                        "responses": {
+                            "200": {
+                                "description": "MCP server list with connection details"
+                            }
+                        }
+                    }
+                },
+                "/ws": {
+                    "get": {
+                        "summary": "WebSocket connection",
+                        "description": "Establish WebSocket for real-time logs and chat streaming",
+                        "tags": ["WebSocket"],
+                        "responses": {
+                            "101": {
+                                "description": "WebSocket connection established"
+                            }
+                        }
+                    }
+                }
+            },
+            "tags": [
+                {"name": "Core", "description": "Core agent status and information"},
+                {"name": "Interfaces", "description": "Network interface management"},
+                {"name": "OSPF", "description": "Open Shortest Path First protocol"},
+                {"name": "BGP", "description": "Border Gateway Protocol"},
+                {"name": "IS-IS", "description": "Intermediate System to Intermediate System"},
+                {"name": "BFD", "description": "Bidirectional Forwarding Detection"},
+                {"name": "GRE", "description": "Generic Routing Encapsulation tunnels"},
+                {"name": "EVPN", "description": "Ethernet VPN"},
+                {"name": "LLDP", "description": "Link Layer Discovery Protocol"},
+                {"name": "Agentic", "description": "AI-powered conversation interface"},
+                {"name": "MCP", "description": "Model Context Protocol servers"},
+                {"name": "WebSocket", "description": "Real-time bidirectional communication"}
+            ]
+        }
+
+        return spec
+
+    @app.get("/api/mcp/servers")
+    async def get_mcp_servers() -> Dict[str, Any]:
+        """
+        Get detailed information about enabled MCP (Model Context Protocol) servers.
+
+        Returns:
+        - Server names and descriptions
+        - Available tools/capabilities
+        - Connection endpoints
+        - Configuration examples for Claude Desktop, VSCode, and direct API access
+        """
+        import os
+
+        mcp_servers = []
+
+        # Get container name for connection instructions
+        container_name = os.environ.get('CONTAINER_NAME', 'unknown')
+        agent_name = os.environ.get('ASI_AGENT_NAME', 'Unknown Agent')
+
+        # Check for agentic bridge and MCP configurations
+        if agentic_bridge and hasattr(agentic_bridge, 'mcp_configs'):
+            for mcp_name, mcp_config in agentic_bridge.mcp_configs.items():
+                enabled = mcp_config.get('enabled', False)
+
+                server_info = {
+                    "name": mcp_name,
+                    "enabled": enabled,
+                    "type": mcp_config.get('type', 'unknown'),
+                    "description": "",
+                    "tools": [],
+                    "connection": {
+                        "protocol": "stdio",
+                        "container": container_name,
+                        "command": ""
+                    }
+                }
+
+                # Add descriptions and tool lists for known MCP types
+                if mcp_name == "routing":
+                    server_info["description"] = "Network routing table access and manipulation"
+                    server_info["tools"] = [
+                        {"name": "get_routes", "description": "Retrieve routing table entries"},
+                        {"name": "add_route", "description": "Add static route"},
+                        {"name": "delete_route", "description": "Remove route"},
+                        {"name": "get_route_info", "description": "Get detailed route information"}
+                    ]
+                    server_info["connection"]["command"] = f"docker exec -i {container_name} python3 -m mcp.servers.routing"
+
+                elif mcp_name == "protocols":
+                    server_info["description"] = "Protocol state access (OSPF, BGP, IS-IS, BFD)"
+                    server_info["tools"] = [
+                        {"name": "get_ospf_neighbors", "description": "Get OSPF neighbor list"},
+                        {"name": "get_ospf_lsdb", "description": "Get OSPF LSDB"},
+                        {"name": "get_bgp_neighbors", "description": "Get BGP peer list"},
+                        {"name": "get_bgp_rib", "description": "Get BGP routing table"},
+                        {"name": "get_isis_neighbors", "description": "Get IS-IS adjacencies"},
+                        {"name": "get_bfd_sessions", "description": "Get BFD session states"}
+                    ]
+                    server_info["connection"]["command"] = f"docker exec -i {container_name} python3 -m mcp.servers.protocols"
+
+                elif mcp_name == "interfaces":
+                    server_info["description"] = "Network interface configuration and monitoring"
+                    server_info["tools"] = [
+                        {"name": "get_interfaces", "description": "List all interfaces"},
+                        {"name": "get_interface_stats", "description": "Get interface statistics"},
+                        {"name": "set_interface_state", "description": "Bring interface up/down"},
+                        {"name": "get_interface_config", "description": "Get interface configuration"}
+                    ]
+                    server_info["connection"]["command"] = f"docker exec -i {container_name} python3 -m mcp.servers.interfaces"
+
+                elif mcp_name == "topology":
+                    server_info["description"] = "Network topology discovery and visualization"
+                    server_info["tools"] = [
+                        {"name": "get_topology", "description": "Get discovered network topology"},
+                        {"name": "get_neighbors", "description": "Get directly connected neighbors"},
+                        {"name": "get_paths", "description": "Get paths between nodes"},
+                        {"name": "export_topology", "description": "Export topology in various formats"}
+                    ]
+                    server_info["connection"]["command"] = f"docker exec -i {container_name} python3 -m mcp.servers.topology"
+
+                elif mcp_name == "testing":
+                    server_info["description"] = "pyATS network testing and validation"
+                    server_info["tools"] = [
+                        {"name": "run_test", "description": "Execute pyATS test"},
+                        {"name": "get_test_results", "description": "Retrieve test results"},
+                        {"name": "list_testcases", "description": "List available tests"},
+                        {"name": "validate_config", "description": "Validate device configuration"}
+                    ]
+                    server_info["connection"]["command"] = f"docker exec -i {container_name} python3 -m mcp.servers.testing"
+
+                mcp_servers.append(server_info)
+
+        # Connection examples for different clients
+        claude_desktop_config = {
+            "mcpServers": {
+                f"{agent_name.lower().replace(' ', '-')}-{server['name']}": {
+                    "command": "docker",
+                    "args": ["exec", "-i", container_name, "python3", "-m", f"mcp.servers.{server['name']}"]
+                }
+                for server in mcp_servers if server["enabled"]
+            }
+        }
+
+        vscode_config = {
+            "mcp.servers": [
+                {
+                    "name": f"{agent_name} - {server['name']}",
+                    "command": server["connection"]["command"],
+                    "type": "stdio"
+                }
+                for server in mcp_servers if server["enabled"]
+            ]
+        }
+
+        return {
+            "agent_name": agent_name,
+            "container_name": container_name,
+            "servers": mcp_servers,
+            "enabled_count": sum(1 for s in mcp_servers if s["enabled"]),
+            "total_count": len(mcp_servers),
+            "connection_examples": {
+                "claude_desktop": {
+                    "description": "Add to Claude Desktop's claude_desktop_config.json",
+                    "config": claude_desktop_config
+                },
+                "vscode": {
+                    "description": "Add to VSCode settings.json",
+                    "config": vscode_config
+                },
+                "direct_api": {
+                    "description": "Connect via WebSocket to /ws endpoint",
+                    "url": f"ws://localhost:8888/ws",
+                    "example": "Use WebSocket client to send MCP JSON-RPC messages"
+                }
+            }
+        }
 
     @app.get("/api/interfaces")
     async def get_interfaces() -> Dict[str, Any]:
@@ -1359,8 +1854,34 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
         """
         # Support both 'count' and 'tail' parameters
         num_entries = tail if tail is not None else count
-        logs = log_buffer.get_recent(num_entries)
-        return {"logs": logs, "count": len(logs)}
+
+        try:
+            logs = log_buffer.get_recent(num_entries)
+
+            # If buffer is empty, add a diagnostic log
+            if len(logs) == 0:
+                logger.debug("Log buffer is empty - no logs captured yet")
+                # Return a helpful message
+                return {
+                    "logs": [{
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                        "level": "INFO",
+                        "message": "No logs captured yet. Logs will appear here when protocols generate events."
+                    }],
+                    "count": 1
+                }
+
+            return {"logs": logs, "count": len(logs)}
+        except Exception as e:
+            logger.error(f"Error fetching logs: {e}")
+            return {
+                "logs": [{
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "level": "ERROR",
+                    "message": f"Error fetching logs: {str(e)}"
+                }],
+                "count": 1
+            }
 
     @app.websocket("/ws/monitor")
     async def websocket_monitor(websocket: WebSocket):
@@ -1602,7 +2123,9 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
 
         try:
             from pyATS_Tests import run_all_tests, get_tests_for_agent
-        except ImportError:
+            from pyATS_Tests.results_storage import get_storage
+        except ImportError as e:
+            logger.error(f"Failed to import pyATS modules: {e}")
             return {
                 "status": "error",
                 "message": "pyATS_Tests module not available",
@@ -1688,13 +2211,26 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
                         "timestamp": result.get("timestamp", datetime.now().isoformat())
                     })
 
-            # Store results for persistence
+            # Store results for persistence (both in-memory and database)
             _recent_test_results = {
                 "results": flattened_results,
                 "timestamp": datetime.now().isoformat(),
                 "summary": test_results.get("summary", {}),
                 "agent_id": agent_id or asi_app.router_id
             }
+
+            # Store in persistent database
+            try:
+                storage = get_storage()
+                storage.store_test_run(
+                    agent_id=agent_id or asi_app.router_id,
+                    results=flattened_results,
+                    summary=test_results.get("summary", {})
+                )
+                logger.info(f"Stored test results in persistent database for agent {agent_id or asi_app.router_id}")
+            except Exception as storage_err:
+                logger.warning(f"Failed to store test results in database: {storage_err}")
+                # Continue anyway - in-memory storage still works
 
             # Return with flattened results for the UI
             return {
@@ -1705,7 +2241,7 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
                 "results": flattened_results
             }
         except Exception as e:
-            logging.getLogger("WebUI").error(f"Test execution failed: {e}")
+            logger.error(f"Test execution failed: {e}", exc_info=True)
             return {
                 "status": "error",
                 "message": str(e),
@@ -1714,6 +2250,20 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
 
     def get_recent_test_results() -> Dict[str, Any]:
         """Get the most recent test results (for page refresh persistence)"""
+        # Try persistent storage first
+        try:
+            from pyATS_Tests.results_storage import get_storage
+            storage = get_storage()
+            agent_id = getattr(asi_app, 'router_id', 'local')
+            stored_results = storage.get_latest_results(agent_id, limit=50)
+
+            if stored_results and stored_results.get("results"):
+                logger.debug(f"Retrieved {len(stored_results['results'])} test results from persistent storage")
+                return stored_results
+        except Exception as e:
+            logger.debug(f"Could not retrieve from persistent storage: {e}")
+
+        # Fall back to in-memory storage
         return _recent_test_results
 
     async def update_test_schedule(
@@ -2079,6 +2629,11 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
                     test = generator.generate_interface_state_test(
                         trigger=TestTrigger.HUMAN_REQUEST
                     )
+                elif test_type == "gre":
+                    # Generate GRE tunnel tests dynamically
+                    test = _generate_gre_test(agent_config)
+                    if test is None:
+                        continue
                 else:
                     continue
 
@@ -2126,37 +2681,65 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
 
     @app.get("/api/pyats/test-types")
     async def get_pyats_test_types() -> Dict[str, Any]:
-        """Get available dynamic test types for pyATS MCP"""
-        return {
-            "test_types": [
-                {
-                    "id": "comprehensive",
-                    "name": "Comprehensive Self-Assessment",
-                    "description": "Full self-test including connectivity, protocols, and interfaces",
-                    "default": True
-                },
-                {
-                    "id": "connectivity",
-                    "name": "Connectivity Tests",
-                    "description": "Ping all configured neighbors and verify reachability"
-                },
-                {
-                    "id": "ospf",
-                    "name": "OSPF State Tests",
-                    "description": "Verify all OSPF neighbors are in FULL state"
-                },
-                {
-                    "id": "bgp",
-                    "name": "BGP State Tests",
-                    "description": "Verify all BGP peers are Established"
-                },
-                {
-                    "id": "interfaces",
-                    "name": "Interface State Tests",
-                    "description": "Verify all interfaces are in expected operational state"
-                }
-            ]
-        }
+        """Get available dynamic test types based on agent's actual configuration"""
+        test_types = [
+            {
+                "id": "comprehensive",
+                "name": "Full Self-Assessment",
+                "description": "All applicable checks for this agent's configuration",
+                "default": True
+            },
+            {
+                "id": "connectivity",
+                "name": "Connectivity Tests",
+                "description": "Ping all configured neighbors and verify reachability"
+            },
+            {
+                "id": "interfaces",
+                "name": "Interface State Tests",
+                "description": "Verify all interfaces are in expected operational state"
+            },
+        ]
+
+        # Only include OSPF tests if OSPF is running
+        if asi_app.ospf_interface:
+            nbr_count = 0
+            try:
+                nbr_count = len(asi_app.ospf_interface.get_neighbors())
+            except Exception:
+                pass
+            test_types.append({
+                "id": "ospf",
+                "name": "OSPF State Tests",
+                "description": f"Verify {nbr_count} OSPF neighbor(s) are in FULL state"
+            })
+
+        # Only include BGP tests if BGP is running
+        if asi_app.bgp_speaker:
+            peer_count = 0
+            try:
+                peer_count = len(asi_app.bgp_speaker.get_peer_status())
+            except Exception:
+                pass
+            test_types.append({
+                "id": "bgp",
+                "name": "BGP State Tests",
+                "description": f"Verify {peer_count} BGP peer(s) are Established"
+            })
+
+        # Only include GRE tests if GRE interfaces exist
+        has_gre = False
+        if hasattr(asi_app, 'interfaces') and asi_app.interfaces:
+            gre_ifaces = [i for i in asi_app.interfaces if i.get("type") == "gre"]
+            if gre_ifaces:
+                has_gre = True
+                test_types.append({
+                    "id": "gre",
+                    "name": "GRE Tunnel Tests",
+                    "description": f"Verify {len(gre_ifaces)} GRE tunnel(s) are up and reachable"
+                })
+
+        return {"test_types": test_types}
 
     @app.get("/api/pyats/status")
     async def get_pyats_mcp_status() -> Dict[str, Any]:
@@ -2326,6 +2909,53 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
                     except Exception as e:
                         details.append(f"? {intf_name}: Error - {e}")
 
+            if category == "gre" or "gre_tunnels" in test_data:
+                # Check GRE tunnel states and ping remote endpoints
+                tunnels = test_data.get("gre_tunnels", [])
+                for tunnel in tunnels:
+                    tun_name = tunnel.get("name", "gre?")
+                    remote_ip = tunnel.get("remote_ip")
+                    # Check interface is UP
+                    try:
+                        result = subprocess.run(
+                            ["ip", "link", "show", tun_name],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        if result.returncode == 0:
+                            is_up = "state up" in result.stdout.lower() or ",up," in result.stdout.lower()
+                        else:
+                            is_up = False
+                    except Exception:
+                        is_up = False
+
+                    if not is_up:
+                        test_results.append({"tunnel": tun_name, "status": "FAILED", "message": "Interface DOWN"})
+                        details.append(f"✗ {tun_name}: Interface DOWN")
+                        overall_status = "FAILED"
+                        continue
+
+                    # Interface is UP, now ping remote endpoint
+                    if remote_ip:
+                        try:
+                            result = subprocess.run(
+                                ["ping", "-c", "2", "-W", "2", "-I", tun_name, str(remote_ip)],
+                                capture_output=True, text=True, timeout=10
+                            )
+                            if result.returncode == 0:
+                                test_results.append({"tunnel": tun_name, "status": "PASSED", "message": f"UP, {remote_ip} reachable"})
+                                details.append(f"✓ {tun_name}: UP, remote {remote_ip} reachable")
+                            else:
+                                test_results.append({"tunnel": tun_name, "status": "FAILED", "message": f"UP but {remote_ip} unreachable"})
+                                details.append(f"✗ {tun_name}: UP but remote {remote_ip} unreachable")
+                                overall_status = "FAILED"
+                        except subprocess.TimeoutExpired:
+                            test_results.append({"tunnel": tun_name, "status": "FAILED", "message": f"Ping timeout to {remote_ip}"})
+                            details.append(f"✗ {tun_name}: Ping timeout to {remote_ip}")
+                            overall_status = "FAILED"
+                    else:
+                        test_results.append({"tunnel": tun_name, "status": "PASSED", "message": "UP (no remote IP to ping)"})
+                        details.append(f"✓ {tun_name}: UP (no remote endpoint configured)")
+
             # If no specific tests ran, mark as passed with note
             if not test_results and not details:
                 details.append("✓ Test configuration validated")
@@ -2349,6 +2979,50 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
             "details": details,
             "expected_outcomes": test.expected_outcomes,
         }
+
+    def _generate_gre_test(agent_config: Dict[str, Any]):
+        """Generate a GRE tunnel test object from agent config"""
+        gre_ifaces = [i for i in agent_config.get("ifs", []) if i.get("t") == "gre"]
+        if not gre_ifaces:
+            return None
+
+        # Build a simple test-like object with the fields _execute_dynamic_test expects
+        class GRETest:
+            def __init__(self, ifaces):
+                self.test_id = "gre_tunnel_check"
+                self.test_name = "GRE Tunnel State"
+                self.description = f"Verify {len(ifaces)} GRE tunnel(s) are up and remote endpoint is reachable"
+                self.expected_outcomes = [f"Tunnel {i.get('n', i.get('id', '?'))} UP and reachable" for i in ifaces]
+
+                class Cat:
+                    value = "gre"
+                self.category = Cat()
+
+                # Build test data with tunnel interfaces and their remote endpoints
+                tunnels = []
+                for iface in ifaces:
+                    addrs = iface.get("a", [])
+                    # For a /30 or /31, the remote endpoint is the other IP in the subnet
+                    remote_ip = None
+                    if addrs:
+                        import ipaddress
+                        try:
+                            net = ipaddress.ip_interface(addrs[0])
+                            network = net.network
+                            for host in network.hosts():
+                                if host != net.ip:
+                                    remote_ip = str(host)
+                                    break
+                        except Exception:
+                            pass
+                    tunnels.append({
+                        "name": iface.get("n") or iface.get("id", "gre?"),
+                        "local_addr": addrs[0] if addrs else None,
+                        "remote_ip": remote_ip,
+                    })
+                self.test_data = {"gre_tunnels": tunnels}
+
+        return GRETest(gre_ifaces)
 
     def _build_agent_config_for_testing() -> Dict[str, Any]:
         """Build TOON-style agent config from current ASI state for test generation"""
@@ -2614,6 +3288,18 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
             bgp_established_count = 0
             bgp_routes_count = 0
 
+            # GRE Tunnel metrics
+            gre_tunnels_total = 0
+            gre_tunnels_up = 0
+            gre_tx_packets = 0
+            gre_rx_packets = 0
+            gre_tx_bytes = 0
+            gre_rx_bytes = 0
+            gre_tx_errors = 0
+            gre_rx_errors = 0
+            gre_keepalive_sent = 0
+            gre_keepalive_recv = 0
+
             # Iterate through agents and their metrics
             for aid, agent_metrics in all_metrics.items():
                 # If specific agent requested (not 'local'), filter
@@ -2710,6 +3396,28 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
                         if "bgp_routes_total" in name_lower:
                             bgp_routes_count += val if isinstance(val, (int, float)) else 0
 
+                        # Extract GRE tunnel metrics
+                        if "gre_tunnels_total" in name_lower:
+                            gre_tunnels_total += val if isinstance(val, (int, float)) else 0
+                        if "gre_tunnels_up" in name_lower:
+                            gre_tunnels_up += val if isinstance(val, (int, float)) else 0
+                        if "gre_tx_packets" in name_lower:
+                            gre_tx_packets += val if isinstance(val, (int, float)) else 0
+                        if "gre_rx_packets" in name_lower:
+                            gre_rx_packets += val if isinstance(val, (int, float)) else 0
+                        if "gre_tx_bytes" in name_lower:
+                            gre_tx_bytes += val if isinstance(val, (int, float)) else 0
+                        if "gre_rx_bytes" in name_lower:
+                            gre_rx_bytes += val if isinstance(val, (int, float)) else 0
+                        if "gre_tx_errors" in name_lower:
+                            gre_tx_errors += val if isinstance(val, (int, float)) else 0
+                        if "gre_rx_errors" in name_lower:
+                            gre_rx_errors += val if isinstance(val, (int, float)) else 0
+                        if "gre_keepalive_sent" in name_lower:
+                            gre_keepalive_sent += val if isinstance(val, (int, float)) else 0
+                        if "gre_keepalive_recv" in name_lower:
+                            gre_keepalive_recv += val if isinstance(val, (int, float)) else 0
+
             return {
                 "metrics": metrics_list,
                 "neighbor_count": neighbor_count,
@@ -2748,6 +3456,20 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
                     "peer_count": bgp_peer_count,
                     "established_count": bgp_established_count,
                     "routes_count": bgp_routes_count
+                },
+                # GRE Tunnel specific metrics
+                "gre": {
+                    "active": gre_tunnels_total > 0,
+                    "tunnels_total": gre_tunnels_total,
+                    "tunnels_up": gre_tunnels_up,
+                    "tx_packets": gre_tx_packets,
+                    "rx_packets": gre_rx_packets,
+                    "tx_bytes": gre_tx_bytes,
+                    "rx_bytes": gre_rx_bytes,
+                    "tx_errors": gre_tx_errors,
+                    "rx_errors": gre_rx_errors,
+                    "keepalive_sent": gre_keepalive_sent,
+                    "keepalive_recv": gre_keepalive_recv
                 }
             }
         except ImportError as e:
