@@ -57,11 +57,11 @@ class OSPFSocket:
             except Exception as e:
                 logger.error(f"Failed to bind to interface {self.interface}: {e}")
 
-            # Bind to specific source IP (not INADDR_ANY)
-            # This ensures each socket only receives packets destined to its IP
-            # Critical for logical interfaces sharing the same physical NIC
-            self.sock.bind((self.source_ip, 0))
-            logger.info(f"Bound socket to IP {self.source_ip}")
+            # RFC 2328: For raw OSPF sockets, bind to INADDR_ANY to receive multicast
+            # SO_BINDTODEVICE (above) ensures we only receive from this interface
+            # Binding to a specific IP would prevent multicast reception on raw sockets
+            self.sock.bind(('0.0.0.0', 0))
+            logger.info(f"Bound socket to INADDR_ANY for interface {self.interface} (source: {self.source_ip})")
 
             # Set TTL for unicast packets (needed for point-to-point unicast neighbors)
             self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, OSPF_UNICAST_TTL)

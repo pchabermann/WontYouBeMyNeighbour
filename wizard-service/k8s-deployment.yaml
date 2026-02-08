@@ -1,0 +1,184 @@
+---
+# ServiceAccount for wizard to interact with K8s API
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: asi-wizard
+  namespace: asi-system
+  labels:
+    app.kubernetes.io/name: asi-wizard
+    app.kubernetes.io/component: wizard
+    app.kubernetes.io/part-of: asi-platform
+
+---
+# ClusterRole for managing AgentTopology CRs
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: asi-wizard
+  labels:
+    app.kubernetes.io/name: asi-wizard
+    app.kubernetes.io/component: wizard
+rules:
+# AgentTopology CR management
+- apiGroups: ["asi.asi.anthropic.com"]
+  resources: ["agenttopologies"]
+  verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+- apiGroups: ["asi.asi.anthropic.com"]
+  resources: ["agenttopologies/status"]
+  verbs: ["get", "list", "watch"]
+# Namespace management (create topology namespaces)
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["create", "get", "list", "watch"]
+# Pod/Deployment management (deploy agent pods)
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps"]
+  verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+# Multus NetworkAttachmentDefinitions
+- apiGroups: ["k8s.cni.cncf.io"]
+  resources: ["network-attachment-definitions"]
+  verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+
+---
+# ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: asi-wizard
+  labels:
+    app.kubernetes.io/name: asi-wizard
+    app.kubernetes.io/component: wizard
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: asi-wizard
+subjects:
+- kind: ServiceAccount
+  name: asi-wizard
+  namespace: asi-system
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: asi-wizard
+  namespace: asi-system
+  labels:
+    app.kubernetes.io/name: asi-wizard
+    app.kubernetes.io/component: wizard
+    app.kubernetes.io/part-of: asi-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: asi-wizard
+  template:
+    metadata:
+      labels:
+        app: asi-wizard
+        app.kubernetes.io/name: asi-wizard
+        app.kubernetes.io/component: wizard
+    spec:
+      serviceAccountName: asi-wizard
+      containers:
+      - name: wizard
+        image: asi-wizard:latest
+        imagePullPolicy: Never
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        envFrom:
+        - secretRef:
+            name: llm-api-keys
+            optional: true
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /api/wizard/health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/wizard/health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: false
+
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: asi-wizard
+  namespace: asi-system
+  labels:
+    app.kubernetes.io/name: asi-wizard
+    app.kubernetes.io/component: wizard
+    app.kubernetes.io/part-of: asi-platform
+spec:
+  type: ClusterIP
+  selector:
+    app: asi-wizard
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+
+---
+# Optional: Ingress for external access
+# Uncomment and configure for your ingress controller
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: asi-wizard
+#   namespace: asi-system
+#   annotations:
+#     nginx.ingress.kubernetes.io/rewrite-target: /
+# spec:
+#   ingressClassName: nginx
+#   rules:
+#   - host: wizard.asi.example.com
+#     http:
+#       paths:
+#       - path: /
+#         pathType: Prefix
+#         backend:
+#           service:
+#             name: asi-wizard
+#             port:
+#               number: 80

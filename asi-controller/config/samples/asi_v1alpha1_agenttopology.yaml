@@ -1,0 +1,139 @@
+---
+apiVersion: asi.asi.anthropic.com/v1alpha1
+kind: AgentTopology
+metadata:
+  name: gre-external-peering
+  namespace: default
+spec:
+  # Define 3 agents: edge, core, and internal routers
+  agents:
+  - name: edge-router
+    protocols:
+    - type: ospf
+      config:
+        area: "0.0.0.0"
+        routerId: "10.255.255.1"
+        helloInterval: "10"
+        deadInterval: "40"
+    interfaces:
+    - name: lo
+      type: loopback
+      addresses:
+      - 10.255.255.1/32
+    - name: eth0
+      type: ethernet
+      addresses:
+      - 10.0.1.1/30
+    llm:
+      model: claude-sonnet-4
+      profile: "You are a senior network engineer specializing in edge routing"
+      temperature: "0.7"
+    mcpServers:
+    - prometheus
+    - filesystem
+    resources:
+      cpuRequest: "500m"
+      memoryRequest: "512Mi"
+      cpuLimit: "1000m"
+      memoryLimit: "1Gi"
+
+  - name: core-router
+    protocols:
+    - type: ospf
+      config:
+        area: "0.0.0.0"
+        routerId: "10.255.255.2"
+        helloInterval: "10"
+        deadInterval: "40"
+    # BGP temporarily disabled until GRE tunnel is configured
+    # - type: bgp
+    #   config:
+    #     asn: "65000"
+    #     routerId: "10.255.255.2"
+    interfaces:
+    - name: lo
+      type: loopback
+      addresses:
+      - 10.255.255.2/32
+    - name: eth0
+      type: ethernet
+      addresses:
+      - 10.0.1.2/30
+    - name: eth1
+      type: ethernet
+      addresses:
+      - 10.0.2.1/30
+    - name: eth2
+      type: ethernet
+      addresses:
+      - 10.255.0.1/30
+    llm:
+      model: claude-sonnet-4
+      profile: "You are a network architect managing core routing infrastructure"
+      temperature: "0.7"
+    mcpServers:
+    - prometheus
+    - filesystem
+    resources:
+      cpuRequest: "1000m"
+      memoryRequest: "1Gi"
+      cpuLimit: "2000m"
+      memoryLimit: "2Gi"
+
+  - name: internal-router
+    protocols:
+    - type: ospf
+      config:
+        area: "0.0.0.0"
+        routerId: "10.255.255.3"
+        helloInterval: "10"
+        deadInterval: "40"
+    interfaces:
+    - name: lo
+      type: loopback
+      addresses:
+      - 10.255.255.3/32
+    - name: eth0
+      type: ethernet
+      addresses:
+      - 10.0.2.2/30
+    llm:
+      model: claude-sonnet-4
+      profile: "You are an internal network specialist"
+      temperature: "0.7"
+    mcpServers:
+    - prometheus
+    resources:
+      cpuRequest: "500m"
+      memoryRequest: "512Mi"
+      cpuLimit: "1000m"
+      memoryLimit: "1Gi"
+
+  # Define point-to-point links between agents
+  links:
+  - name: edge-core
+    endpoints:
+    - agent: edge-router
+      interface: eth0
+    - agent: core-router
+      interface: eth0
+    subnet: fd00:0:1::/64
+    mtu: 1500
+
+  - name: core-internal
+    endpoints:
+    - agent: core-router
+      interface: eth1
+    - agent: internal-router
+      interface: eth0
+    subnet: fd00:0:2::/64
+    mtu: 1500
+
+  - name: core-external
+    endpoints:
+    - agent: core-router
+      interface: eth2
+    - agent: external-frr
+      interface: gre1
+    subnet: fd00:0:3::/64
+    mtu: 1476

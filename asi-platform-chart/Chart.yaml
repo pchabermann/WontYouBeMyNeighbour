@@ -1,0 +1,50 @@
+apiVersion: v2
+name: asi-platform
+description: |
+  Agentic Software Infrastructure (ASI) Platform - Complete cloud-native network
+  agent topology orchestration with LLM integration.
+
+  Includes:
+  - ASI Controller (Kubernetes operator)
+  - Wizard Service (topology builder UI)
+  - Agent image (OSPF/BGP/IS-IS routing with Claude AI)
+  - Observability stack (Prometheus, Grafana)
+
+type: application
+version: 2.0.0
+appVersion: "2.0.0"
+
+keywords:
+  - networking
+  - agents
+  - llm
+  - ai
+  - ospf
+  - bgp
+  - kubernetes
+  - cncf
+
+home: https://github.com/anthropics/wontyoubemyneighbor
+sources:
+  - https://github.com/anthropics/wontyoubemyneighbor
+  - https://github.com/anthropics/asi-controller
+
+maintainers:
+  - name: ASI Team
+    email: asi@anthropic.com
+
+icon: https://raw.githubusercontent.com/anthropics/wontyoubemyneighbor/main/docs/logo.png
+
+# Dependencies (optional)
+dependencies:
+  # Uncomment to include Prometheus operator
+  # - name: kube-prometheus-stack
+  #   version: "54.0.0"
+  #   repository: https://prometheus-community.github.io/helm-charts
+  #   condition: prometheus.enabled
+
+  # Uncomment to include Rook-Ceph
+  # - name: rook-ceph
+  #   version: "1.13.0"
+  #   repository: https://charts.rook.io/release
+  #   condition: storage.rook.enabled

@@ -389,19 +389,27 @@ class AgentDashboard {
             bfd: 'BFD'
         };
 
-        // Core MCP/feature tabs - always shown (LLDP is added separately after Interfaces)
+        // Core MCP/feature tabs - always shown
         const mcpTabs = {
             testing: 'Testing',
             gait: 'GAIT',
             markmap: 'Markmap',
             prometheus: 'Prometheus',
             grafana: 'Grafana',
-            programmability: '🔌 API/MCP',  // OpenAPI + MCP Servers
-            subnet: '🧮',  // Subnet Calculator - small emoji-only tab
-            qos: '📊 QoS',  // QoS RFC 4594 DiffServ
-            netflow: '🌊 NetFlow',  // NetFlow/IPFIX RFC 7011
+            programmability: '🔌 API/MCP',
+            subnet: '🧮',
             logs: 'Logs'
         };
+
+        // Conditional tabs based on agent config
+        // QoS - only show if agent has OSPF or BGP (routing = QoS relevance)
+        if (this.protocols.ospf || this.protocols.bgp) {
+            mcpTabs['qos'] = '📊 QoS';
+        }
+        // NetFlow - only show if agent has GRE interfaces
+        if (this.protocols.gre) {
+            mcpTabs['netflow'] = '🌊 NetFlow';
+        }
 
         let html = '';
 
@@ -2805,18 +2813,56 @@ class AgentDashboard {
             selectAllBtn.addEventListener('click', () => this.toggleAllTests());
         }
 
-        // Update selected count when checkboxes change
-        const testCheckboxes = document.querySelectorAll('#test-suites-list input[type="checkbox"]');
-        testCheckboxes.forEach(cb => {
-            cb.addEventListener('change', () => this.updateSelectedCount());
-        });
+        // Dynamically load test suites based on agent's actual config
+        this.loadTestSuites();
 
-        // Check pyATS MCP status and update count on load
+        // Check pyATS MCP status
         this.checkPyATSMCPStatus();
-        this.updateSelectedCount();
 
         // Fetch previous test results on page load for persistence
         this.fetchPreviousTestResults();
+    }
+
+    async loadTestSuites() {
+        const container = document.getElementById('test-suites-list');
+        if (!container) return;
+
+        try {
+            const response = await fetch('/api/pyats/test-types');
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const data = await response.json();
+            const testTypes = data.test_types || [];
+
+            if (testTypes.length === 0) {
+                container.innerHTML = '<div class="empty-state" style="padding: 10px;">No test suites available for this agent configuration.</div>';
+                return;
+            }
+
+            let html = '';
+            for (const tt of testTypes) {
+                const checked = tt.default ? 'checked' : '';
+                html += `
+                    <div class="test-suite-item">
+                        <label class="test-suite-checkbox">
+                            <input type="checkbox" ${checked} data-pyats-type="${tt.id}">
+                            ${tt.name}
+                        </label>
+                        <span class="test-count">${tt.description}</span>
+                    </div>
+                `;
+            }
+            container.innerHTML = html;
+
+            // Attach change listeners for count update
+            container.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                cb.addEventListener('change', () => this.updateSelectedCount());
+            });
+            this.updateSelectedCount();
+
+        } catch (error) {
+            console.error('Failed to load test suites:', error);
+            container.innerHTML = '<div class="empty-state" style="padding: 10px; color: var(--text-secondary);">Failed to load test suites. Retry by refreshing.</div>';
+        }
     }
 
     updateSelectedCount() {
@@ -5074,7 +5120,7 @@ class AgentDashboard {
     }
 
     initGrafanaCharts() {
-        // State gauge chart
+        // State gauge chart - starts empty, updated from real status
         const stateCtx = document.getElementById('grafana-state-gauge');
         if (stateCtx) {
             this.grafanaStateChart = new Chart(stateCtx, {
@@ -5082,7 +5128,7 @@ class AgentDashboard {
                 data: {
                     labels: ['Healthy', 'Warning', 'Critical'],
                     datasets: [{
-                        data: [85, 10, 5],
+                        data: [0, 0, 0],
                         backgroundColor: ['#4ade80', '#fbbf24', '#ef4444'],
                         borderWidth: 0
                     }]
@@ -5098,7 +5144,7 @@ class AgentDashboard {
             });
         }
 
-        // Neighbor sparkline
+        // Neighbor sparkline - starts at 0, filled from real data
         const neighborCtx = document.getElementById('grafana-neighbor-sparkline');
         if (neighborCtx) {
             this.grafanaNeighborChart = new Chart(neighborCtx, {
@@ -5106,7 +5152,7 @@ class AgentDashboard {
                 data: {
                     labels: Array(10).fill(''),
                     datasets: [{
-                        data: [2, 2, 3, 3, 3, 2, 2, 3, 3, 3],
+                        data: Array(10).fill(0),
                         borderColor: '#f97316',
                         backgroundColor: 'rgba(249, 115, 22, 0.1)',
                         fill: true,
@@ -5118,12 +5164,12 @@ class AgentDashboard {
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: { legend: { display: false } },
-                    scales: { x: { display: false }, y: { display: false } }
+                    scales: { x: { display: false }, y: { display: false, beginAtZero: true } }
                 }
             });
         }
 
-        // Routes sparkline
+        // Routes sparkline - starts at 0, filled from real data
         const routesCtx = document.getElementById('grafana-routes-sparkline');
         if (routesCtx) {
             this.grafanaRoutesChart = new Chart(routesCtx, {
@@ -5131,7 +5177,7 @@ class AgentDashboard {
                 data: {
                     labels: Array(10).fill(''),
                     datasets: [{
-                        data: [10, 12, 15, 14, 16, 18, 17, 19, 20, 21],
+                        data: Array(10).fill(0),
                         borderColor: '#4ade80',
                         backgroundColor: 'rgba(74, 222, 128, 0.1)',
                         fill: true,
@@ -5143,12 +5189,12 @@ class AgentDashboard {
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: { legend: { display: false } },
-                    scales: { x: { display: false }, y: { display: false } }
+                    scales: { x: { display: false }, y: { display: false, beginAtZero: true } }
                 }
             });
         }
 
-        // LSA chart
+        // LSA chart - starts at 0, updated from real LSDB data
         const lsaCtx = document.getElementById('grafana-lsa-chart');
         if (lsaCtx) {
             this.grafanaLsaChart = new Chart(lsaCtx, {
@@ -5156,7 +5202,7 @@ class AgentDashboard {
                 data: {
                     labels: ['Router', 'Network', 'Summary', 'External'],
                     datasets: [{
-                        data: [5, 3, 8, 12],
+                        data: [0, 0, 0, 0],
                         backgroundColor: ['#f97316', '#22d3ee', '#a855f7', '#4ade80']
                     }]
                 },
@@ -5169,7 +5215,7 @@ class AgentDashboard {
             });
         }
 
-        // Interface utilization
+        // Interface utilization - starts at 0
         const ifUtilCtx = document.getElementById('grafana-interface-util');
         if (ifUtilCtx) {
             this.grafanaIfUtilChart = new Chart(ifUtilCtx, {
@@ -5177,32 +5223,8 @@ class AgentDashboard {
                 data: {
                     labels: Array(20).fill(''),
                     datasets: [
-                        { label: 'eth0', data: Array(20).fill(0).map(() => Math.random() * 50), borderColor: '#22d3ee', tension: 0.4 },
-                        { label: 'eth1', data: Array(20).fill(0).map(() => Math.random() * 30), borderColor: '#f97316', tension: 0.4 }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: { legend: { position: 'top', labels: { boxWidth: 10, font: { size: 10 } } } },
-                    scales: {
-                        x: { display: false },
-                        y: { beginAtZero: true, max: 100, grid: { color: 'rgba(255,255,255,0.1)' } }
-                    }
-                }
-            });
-        }
-
-        // Packet rate
-        const pktRateCtx = document.getElementById('grafana-packet-rate');
-        if (pktRateCtx) {
-            this.grafanaPktRateChart = new Chart(pktRateCtx, {
-                type: 'line',
-                data: {
-                    labels: Array(20).fill(''),
-                    datasets: [
-                        { label: 'RX pps', data: Array(20).fill(0).map(() => Math.random() * 1000), borderColor: '#4ade80', tension: 0.4 },
-                        { label: 'TX pps', data: Array(20).fill(0).map(() => Math.random() * 800), borderColor: '#a855f7', tension: 0.4 }
+                        { label: 'RX bytes', data: Array(20).fill(0), borderColor: '#22d3ee', tension: 0.4 },
+                        { label: 'TX bytes', data: Array(20).fill(0), borderColor: '#f97316', tension: 0.4 }
                     ]
                 },
                 options: {
@@ -5216,48 +5238,110 @@ class AgentDashboard {
                 }
             });
         }
+
+        // Packet rate - starts at 0
+        const pktRateCtx = document.getElementById('grafana-packet-rate');
+        if (pktRateCtx) {
+            this.grafanaPktRateChart = new Chart(pktRateCtx, {
+                type: 'line',
+                data: {
+                    labels: Array(20).fill(''),
+                    datasets: [
+                        { label: 'OSPF msgs', data: Array(20).fill(0), borderColor: '#4ade80', tension: 0.4 },
+                        { label: 'Protocol msgs', data: Array(20).fill(0), borderColor: '#a855f7', tension: 0.4 }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { position: 'top', labels: { boxWidth: 10, font: { size: 10 } } } },
+                    scales: {
+                        x: { display: false },
+                        y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.1)' } }
+                    }
+                }
+            });
+        }
+
+        // Immediately fetch real data to populate charts
+        this.updateGrafanaCharts();
     }
 
     async updateGrafanaCharts() {
         try {
-            const response = await fetch(`/api/agent/${this.agentId}/status`);
-            if (response.ok) {
-                const data = await response.json();
+            // Fetch real metrics from the agent
+            const response = await fetch(`/api/agent/${this.agentId}/metrics`);
+            if (!response.ok) return;
+            const data = await response.json();
 
-                // Update dashboard stats
-                document.getElementById('grafana-last-refresh').textContent = new Date().toLocaleTimeString();
+            // Update last refresh timestamp
+            const refreshEl = document.getElementById('grafana-last-refresh');
+            if (refreshEl) refreshEl.textContent = new Date().toLocaleTimeString();
 
-                // Add new data points to charts
-                if (this.grafanaNeighborChart) {
-                    const neighborData = this.grafanaNeighborChart.data.datasets[0].data;
-                    neighborData.push(data.neighbor_count || neighborData[neighborData.length - 1] || 0);
-                    if (neighborData.length > 20) neighborData.shift();
-                    this.grafanaNeighborChart.update('none');
+            // State gauge - calculate from real health data
+            if (this.grafanaStateChart) {
+                const ospfActive = data.ospf && data.ospf.active;
+                const bgpActive = data.bgp && data.bgp.active;
+                const neighborCount = data.neighbor_count || 0;
+                // Simple health: healthy if protocols active and neighbors present
+                let healthy = 0, warning = 0, critical = 0;
+                if (ospfActive || bgpActive) {
+                    healthy = neighborCount > 0 ? 100 : 0;
+                    warning = neighborCount === 0 ? 100 : 0;
+                } else {
+                    critical = 100;
                 }
+                this.grafanaStateChart.data.datasets[0].data = [healthy, warning, critical];
+                this.grafanaStateChart.update('none');
+            }
 
-                if (this.grafanaRoutesChart) {
-                    const routeData = this.grafanaRoutesChart.data.datasets[0].data;
-                    routeData.push(data.route_count || routeData[routeData.length - 1] || 0);
-                    if (routeData.length > 20) routeData.shift();
-                    this.grafanaRoutesChart.update('none');
-                }
+            // Neighbor sparkline - push real neighbor count
+            if (this.grafanaNeighborChart) {
+                const nd = this.grafanaNeighborChart.data.datasets[0].data;
+                nd.push(data.neighbor_count || 0);
+                if (nd.length > 20) nd.shift();
+                this.grafanaNeighborChart.update('none');
+            }
 
-                // Update utilization with random simulation (replace with real data)
-                if (this.grafanaIfUtilChart) {
-                    this.grafanaIfUtilChart.data.datasets.forEach(ds => {
-                        ds.data.push(Math.random() * 50 + 10);
-                        if (ds.data.length > 20) ds.data.shift();
-                    });
-                    this.grafanaIfUtilChart.update('none');
-                }
+            // Routes sparkline - push real route count
+            if (this.grafanaRoutesChart) {
+                const rd = this.grafanaRoutesChart.data.datasets[0].data;
+                rd.push(data.route_count || 0);
+                if (rd.length > 20) rd.shift();
+                this.grafanaRoutesChart.update('none');
+            }
 
-                if (this.grafanaPktRateChart) {
-                    this.grafanaPktRateChart.data.datasets.forEach(ds => {
-                        ds.data.push(Math.random() * 1000);
-                        if (ds.data.length > 20) ds.data.shift();
-                    });
-                    this.grafanaPktRateChart.update('none');
-                }
+            // LSA chart - use real LSDB size (approximate breakdown)
+            if (this.grafanaLsaChart) {
+                const totalLsa = data.lsa_count || 0;
+                // Approximate breakdown: most LSAs are Router LSAs in a simple topology
+                const routerLsa = Math.max(totalLsa, 0);
+                this.grafanaLsaChart.data.datasets[0].data = [routerLsa, 0, 0, 0];
+                this.grafanaLsaChart.update('none');
+            }
+
+            // Interface utilization - use real RX/TX bytes
+            if (this.grafanaIfUtilChart) {
+                const rxDs = this.grafanaIfUtilChart.data.datasets[0];
+                const txDs = this.grafanaIfUtilChart.data.datasets[1];
+                rxDs.data.push(data.rx_bytes || 0);
+                txDs.data.push(data.tx_bytes || 0);
+                if (rxDs.data.length > 20) rxDs.data.shift();
+                if (txDs.data.length > 20) txDs.data.shift();
+                this.grafanaIfUtilChart.update('none');
+            }
+
+            // Protocol message rate - use real OSPF/BGP message counts
+            if (this.grafanaPktRateChart) {
+                const ospfMsgs = data.ospf ? (data.ospf.hello_sent + data.ospf.hello_recv + data.ospf.dbd_sent + data.ospf.dbd_recv) : 0;
+                const bgpMsgs = data.bgp ? (data.bgp.update_sent + data.bgp.update_recv + data.bgp.keepalive_sent + data.bgp.keepalive_recv) : 0;
+                const ospfDs = this.grafanaPktRateChart.data.datasets[0];
+                const bgpDs = this.grafanaPktRateChart.data.datasets[1];
+                ospfDs.data.push(ospfMsgs);
+                bgpDs.data.push(bgpMsgs);
+                if (ospfDs.data.length > 20) ospfDs.data.shift();
+                if (bgpDs.data.length > 20) bgpDs.data.shift();
+                this.grafanaPktRateChart.update('none');
             }
         } catch (error) {
             console.error('Failed to update Grafana charts:', error);

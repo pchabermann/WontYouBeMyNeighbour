@@ -756,8 +756,7 @@ def create_webui_server(asi_app, agentic_bridge) -> FastAPI:
                     "tunnel_count": manager.tunnel_count,
                     "tunnels": manager.list_tunnels()
                 }
-            else:
-                logging.getLogger("WebUI").warning(f"GRE manager not found for agent_id: {gre_agent_id}")
+            # No warning if GRE not configured - it's optional
         except ImportError as e:
             logging.getLogger("WebUI").warning(f"GRE import error: {e}")
         except Exception as e:
@@ -2630,6 +2629,11 @@ Currently no authentication required for localhost access. For production deploy
                     test = generator.generate_interface_state_test(
                         trigger=TestTrigger.HUMAN_REQUEST
                     )
+                elif test_type == "gre":
+                    # Generate GRE tunnel tests dynamically
+                    test = _generate_gre_test(agent_config)
+                    if test is None:
+                        continue
                 else:
                     continue
 
@@ -2677,37 +2681,65 @@ Currently no authentication required for localhost access. For production deploy
 
     @app.get("/api/pyats/test-types")
     async def get_pyats_test_types() -> Dict[str, Any]:
-        """Get available dynamic test types for pyATS MCP"""
-        return {
-            "test_types": [
-                {
-                    "id": "comprehensive",
-                    "name": "Comprehensive Self-Assessment",
-                    "description": "Full self-test including connectivity, protocols, and interfaces",
-                    "default": True
-                },
-                {
-                    "id": "connectivity",
-                    "name": "Connectivity Tests",
-                    "description": "Ping all configured neighbors and verify reachability"
-                },
-                {
-                    "id": "ospf",
-                    "name": "OSPF State Tests",
-                    "description": "Verify all OSPF neighbors are in FULL state"
-                },
-                {
-                    "id": "bgp",
-                    "name": "BGP State Tests",
-                    "description": "Verify all BGP peers are Established"
-                },
-                {
-                    "id": "interfaces",
-                    "name": "Interface State Tests",
-                    "description": "Verify all interfaces are in expected operational state"
-                }
-            ]
-        }
+        """Get available dynamic test types based on agent's actual configuration"""
+        test_types = [
+            {
+                "id": "comprehensive",
+                "name": "Full Self-Assessment",
+                "description": "All applicable checks for this agent's configuration",
+                "default": True
+            },
+            {
+                "id": "connectivity",
+                "name": "Connectivity Tests",
+                "description": "Ping all configured neighbors and verify reachability"
+            },
+            {
+                "id": "interfaces",
+                "name": "Interface State Tests",
+                "description": "Verify all interfaces are in expected operational state"
+            },
+        ]
+
+        # Only include OSPF tests if OSPF is running
+        if asi_app.ospf_interface:
+            nbr_count = 0
+            try:
+                nbr_count = len(asi_app.ospf_interface.get_neighbors())
+            except Exception:
+                pass
+            test_types.append({
+                "id": "ospf",
+                "name": "OSPF State Tests",
+                "description": f"Verify {nbr_count} OSPF neighbor(s) are in FULL state"
+            })
+
+        # Only include BGP tests if BGP is running
+        if asi_app.bgp_speaker:
+            peer_count = 0
+            try:
+                peer_count = len(asi_app.bgp_speaker.get_peer_status())
+            except Exception:
+                pass
+            test_types.append({
+                "id": "bgp",
+                "name": "BGP State Tests",
+                "description": f"Verify {peer_count} BGP peer(s) are Established"
+            })
+
+        # Only include GRE tests if GRE interfaces exist
+        has_gre = False
+        if hasattr(asi_app, 'interfaces') and asi_app.interfaces:
+            gre_ifaces = [i for i in asi_app.interfaces if i.get("type") == "gre"]
+            if gre_ifaces:
+                has_gre = True
+                test_types.append({
+                    "id": "gre",
+                    "name": "GRE Tunnel Tests",
+                    "description": f"Verify {len(gre_ifaces)} GRE tunnel(s) are up and reachable"
+                })
+
+        return {"test_types": test_types}
 
     @app.get("/api/pyats/status")
     async def get_pyats_mcp_status() -> Dict[str, Any]:
@@ -2877,6 +2909,53 @@ Currently no authentication required for localhost access. For production deploy
                     except Exception as e:
                         details.append(f"? {intf_name}: Error - {e}")
 
+            if category == "gre" or "gre_tunnels" in test_data:
+                # Check GRE tunnel states and ping remote endpoints
+                tunnels = test_data.get("gre_tunnels", [])
+                for tunnel in tunnels:
+                    tun_name = tunnel.get("name", "gre?")
+                    remote_ip = tunnel.get("remote_ip")
+                    # Check interface is UP
+                    try:
+                        result = subprocess.run(
+                            ["ip", "link", "show", tun_name],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        if result.returncode == 0:
+                            is_up = "state up" in result.stdout.lower() or ",up," in result.stdout.lower()
+                        else:
+                            is_up = False
+                    except Exception:
+                        is_up = False
+
+                    if not is_up:
+                        test_results.append({"tunnel": tun_name, "status": "FAILED", "message": "Interface DOWN"})
+                        details.append(f"✗ {tun_name}: Interface DOWN")
+                        overall_status = "FAILED"
+                        continue
+
+                    # Interface is UP, now ping remote endpoint
+                    if remote_ip:
+                        try:
+                            result = subprocess.run(
+                                ["ping", "-c", "2", "-W", "2", "-I", tun_name, str(remote_ip)],
+                                capture_output=True, text=True, timeout=10
+                            )
+                            if result.returncode == 0:
+                                test_results.append({"tunnel": tun_name, "status": "PASSED", "message": f"UP, {remote_ip} reachable"})
+                                details.append(f"✓ {tun_name}: UP, remote {remote_ip} reachable")
+                            else:
+                                test_results.append({"tunnel": tun_name, "status": "FAILED", "message": f"UP but {remote_ip} unreachable"})
+                                details.append(f"✗ {tun_name}: UP but remote {remote_ip} unreachable")
+                                overall_status = "FAILED"
+                        except subprocess.TimeoutExpired:
+                            test_results.append({"tunnel": tun_name, "status": "FAILED", "message": f"Ping timeout to {remote_ip}"})
+                            details.append(f"✗ {tun_name}: Ping timeout to {remote_ip}")
+                            overall_status = "FAILED"
+                    else:
+                        test_results.append({"tunnel": tun_name, "status": "PASSED", "message": "UP (no remote IP to ping)"})
+                        details.append(f"✓ {tun_name}: UP (no remote endpoint configured)")
+
             # If no specific tests ran, mark as passed with note
             if not test_results and not details:
                 details.append("✓ Test configuration validated")
@@ -2900,6 +2979,50 @@ Currently no authentication required for localhost access. For production deploy
             "details": details,
             "expected_outcomes": test.expected_outcomes,
         }
+
+    def _generate_gre_test(agent_config: Dict[str, Any]):
+        """Generate a GRE tunnel test object from agent config"""
+        gre_ifaces = [i for i in agent_config.get("ifs", []) if i.get("t") == "gre"]
+        if not gre_ifaces:
+            return None
+
+        # Build a simple test-like object with the fields _execute_dynamic_test expects
+        class GRETest:
+            def __init__(self, ifaces):
+                self.test_id = "gre_tunnel_check"
+                self.test_name = "GRE Tunnel State"
+                self.description = f"Verify {len(ifaces)} GRE tunnel(s) are up and remote endpoint is reachable"
+                self.expected_outcomes = [f"Tunnel {i.get('n', i.get('id', '?'))} UP and reachable" for i in ifaces]
+
+                class Cat:
+                    value = "gre"
+                self.category = Cat()
+
+                # Build test data with tunnel interfaces and their remote endpoints
+                tunnels = []
+                for iface in ifaces:
+                    addrs = iface.get("a", [])
+                    # For a /30 or /31, the remote endpoint is the other IP in the subnet
+                    remote_ip = None
+                    if addrs:
+                        import ipaddress
+                        try:
+                            net = ipaddress.ip_interface(addrs[0])
+                            network = net.network
+                            for host in network.hosts():
+                                if host != net.ip:
+                                    remote_ip = str(host)
+                                    break
+                        except Exception:
+                            pass
+                    tunnels.append({
+                        "name": iface.get("n") or iface.get("id", "gre?"),
+                        "local_addr": addrs[0] if addrs else None,
+                        "remote_ip": remote_ip,
+                    })
+                self.test_data = {"gre_tunnels": tunnels}
+
+        return GRETest(gre_ifaces)
 
     def _build_agent_config_for_testing() -> Dict[str, Any]:
         """Build TOON-style agent config from current ASI state for test generation"""

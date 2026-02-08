@@ -1,0 +1,302 @@
+[
+  {
+    "id": "gait",
+    "t": "gait",
+    "n": "GAIT",
+    "d": "AI session tracking and context management",
+    "url": "https://github.com/automateyournetwork/gait_mcp",
+    "e": true,
+    "mandatory": true,
+    "c": {
+      "_config_fields": [],
+      "_requires_config": false
+    }
+  },
+  {
+    "id": "pyats",
+    "t": "pyats",
+    "n": "pyATS",
+    "d": "Cisco pyATS network testing and validation",
+    "url": "https://github.com/automateyournetwork/pyATS_MCP",
+    "e": true,
+    "mandatory": true,
+    "c": {
+      "_config_fields": [],
+      "_requires_config": false
+    }
+  },
+  {
+    "id": "rfc",
+    "t": "rfc",
+    "n": "RFC",
+    "d": "IETF RFC standards reference and lookup",
+    "url": "https://github.com/mjpitz/mcp-rfc",
+    "e": true,
+    "mandatory": true,
+    "c": {
+      "_config_fields": [],
+      "_requires_config": false
+    }
+  },
+  {
+    "id": "markmap",
+    "t": "markmap",
+    "n": "Markmap",
+    "d": "Network topology visualization as mind maps",
+    "url": "https://github.com/automateyournetwork/markmap_mcp",
+    "e": true,
+    "mandatory": true,
+    "c": {
+      "_config_fields": [],
+      "_requires_config": false
+    }
+  },
+  {
+    "id": "prometheus",
+    "t": "prometheus",
+    "n": "Prometheus",
+    "d": "Agent metrics collection and alerting",
+    "url": "https://github.com/pab1it0/prometheus-mcp-server",
+    "e": true,
+    "mandatory": true,
+    "c": {
+      "_config_fields": [],
+      "_requires_config": false
+    }
+  },
+  {
+    "id": "grafana",
+    "t": "grafana",
+    "n": "Grafana",
+    "d": "Agent dashboard visualization and monitoring",
+    "url": "https://github.com/grafana/mcp-grafana",
+    "e": true,
+    "mandatory": true,
+    "c": {
+      "_config_fields": [],
+      "_requires_config": false
+    }
+  },
+  {
+    "id": "subnet",
+    "t": "subnet",
+    "n": "Subnet Calculator",
+    "d": "IPv4 and IPv6 subnet calculation and IP analysis",
+    "url": "https://github.com/automateyournetwork/NAF_AC4/tree/main/MCP/Lab02",
+    "e": true,
+    "mandatory": true,
+    "c": {
+      "_config_fields": [],
+      "_requires_config": false
+    }
+  },
+  {
+    "id": "servicenow",
+    "t": "servicenow",
+    "n": "ServiceNow",
+    "d": "ITSM integration for incident management",
+    "url": "https://github.com/echelon-ai-labs/servicenow-mcp",
+    "e": false,
+    "mandatory": false,
+    "c": {
+      "_config_fields": [
+        {
+          "id": "instance_url",
+          "label": "Instance URL",
+          "type": "url",
+          "placeholder": "https://your-instance.service-now.com",
+          "required": true,
+          "hint": "Your ServiceNow instance URL"
+        },
+        {
+          "id": "username",
+          "label": "Username",
+          "type": "text",
+          "placeholder": "admin",
+          "required": true,
+          "hint": "ServiceNow username"
+        },
+        {
+          "id": "password",
+          "label": "Password",
+          "type": "password",
+          "placeholder": "",
+          "required": true,
+          "hint": "ServiceNow password"
+        }
+      ],
+      "_requires_config": true
+    }
+  },
+  {
+    "id": "netbox",
+    "t": "netbox",
+    "n": "NetBox",
+    "d": "Network source of truth (DCIM/IPAM)",
+    "url": "https://github.com/netboxlabs/netbox-mcp-server",
+    "e": false,
+    "mandatory": false,
+    "c": {
+      "_config_fields": [
+        {
+          "id": "netbox_url",
+          "label": "NetBox URL",
+          "type": "url",
+          "placeholder": "https://netbox.example.com",
+          "required": true,
+          "hint": "Your NetBox instance URL"
+        },
+        {
+          "id": "api_token",
+          "label": "API Token",
+          "type": "password",
+          "placeholder": "",
+          "required": true,
+          "hint": "NetBox API token (Admin > API Tokens)"
+        },
+        {
+          "id": "site_name",
+          "label": "Site",
+          "type": "text",
+          "placeholder": "DC1",
+          "required": true,
+          "hint": "NetBox site name - used for both push and pull operations"
+        },
+        {
+          "id": "_separator_1",
+          "type": "separator",
+          "label": "Direction"
+        },
+        {
+          "id": "auto_register",
+          "label": "Push: Register agents in NetBox",
+          "type": "checkbox",
+          "default": false,
+          "hint": "When agents are built, create devices in NetBox with interfaces, IPs, and protocol services"
+        },
+        {
+          "id": "auto_build",
+          "label": "Pull: Build agents from NetBox",
+          "type": "checkbox",
+          "default": false,
+          "hint": "Query NetBox site and auto-create one agent per device found"
+        }
+      ],
+      "_requires_config": true
+    }
+  },
+  {
+    "id": "slack",
+    "t": "slack",
+    "n": "Slack",
+    "d": "Team notifications and collaboration",
+    "url": "https://docs.slack.dev/ai/mcp-server/",
+    "e": false,
+    "mandatory": false,
+    "c": {
+      "_config_fields": [
+        {
+          "id": "bot_token",
+          "label": "Bot Token",
+          "type": "password",
+          "placeholder": "xoxb-...",
+          "required": true,
+          "hint": "Slack Bot OAuth Token (starts with xoxb-)"
+        },
+        {
+          "id": "default_channel",
+          "label": "Default Channel",
+          "type": "text",
+          "placeholder": "#network-alerts",
+          "required": false,
+          "hint": "Optional: Default channel for notifications"
+        }
+      ],
+      "_requires_config": true
+    }
+  },
+  {
+    "id": "github",
+    "t": "github",
+    "n": "GitHub",
+    "d": "Version control and repository management",
+    "url": "https://github.com/github/github-mcp-server",
+    "e": false,
+    "mandatory": false,
+    "c": {
+      "_config_fields": [
+        {
+          "id": "personal_access_token",
+          "label": "Personal Access Token",
+          "type": "password",
+          "placeholder": "ghp_...",
+          "required": true,
+          "hint": "GitHub PAT with repo access (Settings > Developer settings > PAT)"
+        },
+        {
+          "id": "default_repo",
+          "label": "Default Repository",
+          "type": "text",
+          "placeholder": "owner/repo",
+          "required": false,
+          "hint": "Optional: Default repository (owner/repo format)"
+        }
+      ],
+      "_requires_config": true
+    }
+  },
+  {
+    "id": "smtp",
+    "t": "smtp",
+    "n": "SMTP Email",
+    "d": "Send email notifications and reports via SMTP",
+    "url": "",
+    "e": false,
+    "mandatory": false,
+    "c": {
+      "_config_fields": [
+        {
+          "id": "smtp_server",
+          "label": "SMTP Server",
+          "type": "text",
+          "placeholder": "smtp.gmail.com",
+          "required": true,
+          "hint": "SMTP server hostname"
+        },
+        {
+          "id": "smtp_port",
+          "label": "SMTP Port",
+          "type": "number",
+          "placeholder": "587",
+          "required": true,
+          "hint": "587 for TLS, 465 for SSL"
+        },
+        {
+          "id": "smtp_username",
+          "label": "Gmail Address",
+          "type": "email",
+          "placeholder": "",
+          "required": true,
+          "hint": "MUST match the account used to generate the App Password below"
+        },
+        {
+          "id": "smtp_password",
+          "label": "App Password",
+          "type": "password",
+          "placeholder": "",
+          "required": true,
+          "hint": "16-character code from Google App Passwords (no spaces)"
+        },
+        {
+          "id": "smtp_use_tls",
+          "label": "Use TLS",
+          "type": "checkbox",
+          "default": true,
+          "required": false,
+          "hint": "Recommended for port 587"
+        }
+      ],
+      "_requires_config": true
+    }
+  }
+]

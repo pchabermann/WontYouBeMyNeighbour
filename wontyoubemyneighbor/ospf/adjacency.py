@@ -36,10 +36,26 @@ class AdjacencyManager:
         self.router_id = router_id
         self.lsdb = lsdb
         self.interface_mtu = 1500
+        self._iface_mtu_cache: dict = {}
 
         logger.info(f"Initialized AdjacencyManager for {router_id}")
 
-    def build_initial_dbd_packet(self, neighbor: OSPFNeighbor, area_id: str) -> bytes:
+    def get_interface_mtu(self, iface_name: str = None) -> int:
+        """Read actual interface MTU from kernel, with caching."""
+        if not iface_name:
+            return self.interface_mtu
+        if iface_name in self._iface_mtu_cache:
+            return self._iface_mtu_cache[iface_name]
+        try:
+            with open(f"/sys/class/net/{iface_name}/mtu") as f:
+                mtu = int(f.read().strip())
+                self._iface_mtu_cache[iface_name] = mtu
+                logger.debug(f"Read MTU {mtu} for interface {iface_name}")
+                return mtu
+        except (OSError, ValueError):
+            return self.interface_mtu
+
+    def build_initial_dbd_packet(self, neighbor: OSPFNeighbor, area_id: str, iface_name: str = None) -> bytes:
         """
         Build initial Database Description packet (ExStart state)
 
@@ -77,7 +93,7 @@ class AdjacencyManager:
         )
 
         dbd = OSPFDBDescription(
-            interface_mtu=self.interface_mtu,
+            interface_mtu=self.get_interface_mtu(iface_name),
             options=0x02,  # E-bit
             flags=0x07,    # I=1, M=1, MS=1 - claim master in ExStart
             dd_sequence=dd_sequence
@@ -90,7 +106,7 @@ class AdjacencyManager:
 
         return bytes(packet)
 
-    def build_slave_ack_dbd_packet(self, neighbor: OSPFNeighbor, area_id: str) -> bytes:
+    def build_slave_ack_dbd_packet(self, neighbor: OSPFNeighbor, area_id: str, iface_name: str = None) -> bytes:
         """
         Build slave acknowledgment DBD packet
 
@@ -115,7 +131,7 @@ class AdjacencyManager:
 
         # Slave ack: I=0, M=1, MS=0 = 0x02
         dbd = OSPFDBDescription(
-            interface_mtu=self.interface_mtu,
+            interface_mtu=self.get_interface_mtu(iface_name),
             options=0x02,  # E-bit
             flags=0x02,    # I=0, M=1 (we have more), MS=0 (slave)
             dd_sequence=neighbor.dd_sequence_number
@@ -130,7 +146,7 @@ class AdjacencyManager:
 
     def build_dbd_packet(self, neighbor: OSPFNeighbor, area_id: str,
                         lsa_headers: Optional[List[LSAHeader]] = None,
-                        is_more: bool = False) -> bytes:
+                        is_more: bool = False, iface_name: str = None) -> bytes:
         """
         Build Database Description packet (Exchange state)
 
@@ -168,7 +184,7 @@ class AdjacencyManager:
         logger.info(f"Building DBD with neighbor.dd_sequence_number = {neighbor.dd_sequence_number}")
 
         dbd = OSPFDBDescription(
-            interface_mtu=self.interface_mtu,
+            interface_mtu=self.get_interface_mtu(iface_name),
             options=0x02,
             flags=flags,
             dd_sequence=neighbor.dd_sequence_number
@@ -242,7 +258,7 @@ class AdjacencyManager:
                     return (False, [], False)
 
             else:
-                logger.warning(f"Received DBD in unexpected state: {neighbor.get_state_name()}")
+                logger.debug(f"Received DBD in unexpected state: {neighbor.get_state_name()}")
                 return (False, [], False)
 
         except Exception as e:

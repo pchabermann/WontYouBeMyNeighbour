@@ -147,7 +147,7 @@ class KernelRouteManager:
         try:
             # Clear any existing FORWARD logging rules
             subprocess.run(["iptables", "-D", "FORWARD", "-j", "LOG"],
-                          capture_output=True, stderr=subprocess.DEVNULL)
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             if specific_prefixes:
                 # Log forwarding to specific destinations

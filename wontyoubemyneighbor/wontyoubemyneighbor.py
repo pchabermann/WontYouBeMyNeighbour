@@ -147,65 +147,91 @@ class WontYouBeMyNeighbor:
                 })
 
     async def start_gre_tunnels(self):
-        """Initialize GRE tunnels from config"""
+        """Initialize GRE tunnels from config.
+
+        Creates kernel GRE tunnel interfaces (via 'ip tunnel add') so OSPF
+        can run natively over them, plus registers the tunnel with the GRE
+        manager for dashboard/metrics tracking.
+        """
         if not hasattr(self, 'gre_tunnels') or not self.gre_tunnels:
             return
 
         logger = logging.getLogger("WontYouBeMyNeighbor")
         logger.info(f"Starting {len(self.gre_tunnels)} GRE tunnel(s)")
 
-        try:
-            from gre import configure_gre_manager, GRETunnelConfig
+        import subprocess as _sub
 
-            agent_id = os.environ.get('ASI_AGENT_ID', 'local')
+        for tun in self.gre_tunnels:
+            name = tun['name']
+            remote_ip = tun.get('remote_ip')
+            if not remote_ip:
+                logger.warning(f"GRE tunnel {name} missing remote_ip, skipping")
+                continue
 
-            for tun in self.gre_tunnels:
-                if not tun.get('remote_ip'):
-                    logger.warning(f"GRE tunnel {tun['name']} missing remote_ip, skipping")
-                    continue
+            local_ip = tun.get('local_ip')
+            if not local_ip:
+                for iface in self.interfaces:
+                    if iface['type'] != 'gre' and iface['addresses']:
+                        local_ip = iface['addresses'][0].split('/')[0]
+                        break
+            if not local_ip:
+                logger.warning(f"GRE tunnel {name} could not determine local_ip, skipping")
+                continue
 
-                # Get local IP from config or first non-GRE interface
-                local_ip = tun.get('local_ip')
-                if not local_ip:
-                    for iface in self.interfaces:
-                        if iface['type'] != 'gre' and iface['addresses']:
-                            local_ip = iface['addresses'][0].split('/')[0]
-                            break
+            tunnel_ip = tun.get('tunnel_ip', '')
+            key = tun.get('key')
+            mtu = tun.get('mtu', 1400)
+            ttl = tun.get('ttl', 255)
 
-                if not local_ip:
-                    logger.warning(f"GRE tunnel {tun['name']} could not determine local_ip, skipping")
-                    continue
+            # --- Create kernel GRE tunnel interface ---
+            try:
+                cmd = ['ip', 'tunnel', 'add', name, 'mode', 'gre',
+                       'remote', remote_ip, 'local', local_ip,
+                       'ttl', str(ttl)]
+                if key is not None:
+                    cmd += ['key', str(key)]
+                _sub.run(cmd, capture_output=True, timeout=5)
 
-                # Create or get GRE manager
+                if tunnel_ip:
+                    _sub.run(['ip', 'addr', 'add', tunnel_ip, 'dev', name],
+                             capture_output=True, timeout=5)
+
+                _sub.run(['ip', 'link', 'set', name, 'up', 'mtu', str(mtu)],
+                         capture_output=True, timeout=5)
+
+                # Verify the interface came up
+                result = _sub.run(['ip', 'link', 'show', name],
+                                  capture_output=True, text=True, timeout=5)
+                if result.returncode == 0 and 'UP' in result.stdout:
+                    logger.info(f"Kernel GRE tunnel {name} UP: {local_ip} -> {remote_ip} "
+                                f"(overlay {tunnel_ip}, key={key}, mtu={mtu})")
+                    # Store the kernel interface name for OSPF
+                    self._kernel_gre_interfaces = getattr(self, '_kernel_gre_interfaces', [])
+                    self._kernel_gre_interfaces.append(name)
+                else:
+                    logger.error(f"Kernel GRE tunnel {name} failed to come up")
+            except Exception as e:
+                logger.error(f"Failed to create kernel GRE tunnel {name}: {e}")
+
+            # --- Register with GRE manager for dashboard/metrics ---
+            try:
+                from gre import configure_gre_manager, GRETunnelConfig
+                agent_id = os.environ.get('ASI_AGENT_ID', 'local')
                 manager = configure_gre_manager(agent_id, local_ip)
                 if not manager.running:
                     await manager.start()
-
-                # Create tunnel config
                 config = GRETunnelConfig(
-                    name=tun['name'],
-                    local_ip=local_ip,
-                    remote_ip=tun['remote_ip'],
-                    tunnel_ip=tun.get('tunnel_ip', ''),
-                    key=tun.get('key'),
+                    name=name, local_ip=local_ip, remote_ip=remote_ip,
+                    tunnel_ip=tunnel_ip, key=key,
                     use_checksum=tun.get('use_checksum', False),
                     use_sequence=tun.get('use_sequence', False),
-                    mtu=tun.get('mtu', 1400),
+                    mtu=mtu,
                     keepalive_interval=tun.get('keepalive_interval', 10),
                     description=tun.get('description', '')
                 )
-
-                # Create the tunnel
-                tunnel = await manager.create_tunnel(config)
-                if tunnel:
-                    logger.info(f"GRE tunnel {tun['name']} started: {local_ip} -> {tun['remote_ip']}")
-                else:
-                    logger.error(f"Failed to create GRE tunnel {tun['name']}")
-
-        except ImportError as e:
-            logger.warning(f"GRE module not available: {e}")
-        except Exception as e:
-            logger.error(f"Error starting GRE tunnels: {e}")
+                await manager.create_tunnel(config)
+            except Exception as e:
+                logger.debug(f"GRE manager registration for {name}: {e}")
 
     def load_config_from_env(self):
         """Load agent config from environment variable"""
@@ -1115,12 +1141,16 @@ class OSPFAgent:
                         continue  # Skip routes to self
 
                     # Resolve router ID to interface IP using neighbor table
+                    # Search across ALL interfaces, not just primary
                     actual_gateway = None
-                    if next_hop_router_id in self.neighbors:
-                        neighbor = self.neighbors[next_hop_router_id]
-                        actual_gateway = neighbor.ip_address
-                        self.logger.debug(f"Resolved next-hop {next_hop_router_id} -> {actual_gateway}")
-                    else:
+                    for iface_name, ctx in self.interfaces_ctx.items():
+                        if next_hop_router_id in ctx.neighbors:
+                            neighbor = ctx.neighbors[next_hop_router_id]
+                            actual_gateway = neighbor.ip_address
+                            self.logger.debug(f"Resolved next-hop {next_hop_router_id} -> {actual_gateway} (interface {iface_name})")
+                            break
+
+                    if not actual_gateway:
                         # Fallback strategies for resolving next-hop:
                         # 1. Check if next_hop looks like an IP address already
                         import ipaddress
@@ -1205,8 +1235,10 @@ class OSPFAgent:
                 self.logger.debug("No LSAs to flood")
                 return
 
-            # Get all Full neighbors
-            full_neighbors = [n for n in self.neighbors.values() if n.is_full()]
+            # Get all Full neighbors from ALL interfaces (not just primary)
+            full_neighbors = []
+            for iface_name, ctx in self.interfaces_ctx.items():
+                full_neighbors.extend([n for n in ctx.neighbors.values() if n.is_full()])
 
             if not full_neighbors:
                 self.logger.debug("No Full neighbors to flood to")
@@ -1362,7 +1394,7 @@ class OSPFAgent:
         success, lsa_headers_needed, neighbor_dbd_complete = self.adjacency_mgr.process_dbd(data, neighbor)
 
         if not success:
-            self.logger.warning(f"Failed to process DBD from {neighbor_id}")
+            self.logger.debug(f"Failed to process DBD from {neighbor_id} (transient during adjacency formation)")
             return
 
         # Add needed LSAs to request list
@@ -1393,7 +1425,7 @@ class OSPFAgent:
                     # Send slave acknowledgment DBD (empty, with M=1)
                     self.logger.info(f"[{iface_name}] Sending slave ack DBD to {neighbor_id}")
                     slave_ack = self.adjacency_mgr.build_slave_ack_dbd_packet(
-                        neighbor, self.area_id
+                        neighbor, self.area_id, iface_name
                     )
                     self._send_to_neighbor(slave_ack, neighbor, iface_name)
                 else:
@@ -1414,7 +1446,7 @@ class OSPFAgent:
         elif new_state == STATE_EXCHANGE:
             # In Exchange state, we must respond to each received DBD
             # This is the request/response nature of OSPF DBD exchange
-            await self._send_dbd(neighbor)
+            await self._send_dbd(neighbor, iface_name)
 
             # CRITICAL: _send_dbd() may call exchange_done() which transitions to Loading
             # We need to check if state changed and send LSR if needed
@@ -1432,7 +1464,7 @@ class OSPFAgent:
         elif new_state in (STATE_LOADING, STATE_FULL) and success:
             # We're slave and received a duplicate DBD - respond to acknowledge
             self.logger.info(f"Responding to duplicate DBD from {neighbor_id}")
-            await self._send_dbd(neighbor)
+            await self._send_dbd(neighbor, iface_name)
 
     async def _process_lsr(self, data: bytes, neighbor_id: str, iface_name: str):
         """
@@ -1501,8 +1533,10 @@ class OSPFAgent:
             if external_lsas:
                 self.logger.info(f"Flooding {len(external_lsas)} external LSAs to other neighbors")
                 for lsa in external_lsas:
-                    # Get all neighbors as list
-                    neighbor_list = list(self.neighbors.values())
+                    # Get all neighbors from ALL interfaces (not just primary)
+                    neighbor_list = []
+                    for iface_name, ctx in self.interfaces_ctx.items():
+                        neighbor_list.extend(ctx.neighbors.values())
 
                     # Flood to all neighbors except sender
                     lsu_packets = self.flooding_mgr.flood_lsa_to_neighbors(
@@ -1559,7 +1593,7 @@ class OSPFAgent:
         try:
             self.logger.info(f"[{iface_name}] Building initial DBD for {neighbor.router_id}...")
             # Build initial DBD packet
-            dbd_packet = self.adjacency_mgr.build_initial_dbd_packet(neighbor, self.area_id)
+            dbd_packet = self.adjacency_mgr.build_initial_dbd_packet(neighbor, self.area_id, iface_name)
 
             self.logger.info(f"[{iface_name}] Sending initial DBD to {neighbor.ip_address}...")
             # Send DBD unicast to neighbor using the correct interface socket
@@ -1586,7 +1620,7 @@ class OSPFAgent:
 
         # Build DBD packet
         dbd_packet = self.adjacency_mgr.build_dbd_packet(
-            neighbor, self.area_id, lsa_headers, has_more
+            neighbor, self.area_id, lsa_headers, has_more, iface_name
         )
 
         # Send DBD unicast to neighbor using correct interface
@@ -1785,7 +1819,7 @@ async def run_unified_agent(args: argparse.Namespace):
     # For now, use the first interface for OSPF (multi-interface support coming soon)
     primary_ospf_interface = ospf_interfaces[0] if ospf_interfaces else None
     if len(ospf_interfaces) > 1:
-        logger.warning(f"Multi-interface OSPF requested ({', '.join(ospf_interfaces)}), using {primary_ospf_interface} as primary. Full multi-interface support coming soon.")
+        logger.info(f"Multi-interface OSPF: {', '.join(ospf_interfaces)} (primary: {primary_ospf_interface})")
 
     # Determine agent type for banner
     protocols = []
@@ -1814,8 +1848,9 @@ async def run_unified_agent(args: argparse.Namespace):
 
         # Enable IP forwarding in kernel
         try:
-            subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"],
-                          capture_output=True, timeout=5)
+            import subprocess as _subprocess
+            _subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"],
+                           capture_output=True, timeout=5)
             logger.info("✓ IP forwarding enabled")
         except Exception as e:
             logger.warning(f"Could not enable IP forwarding: {e}")
@@ -2069,6 +2104,9 @@ async def run_unified_agent(args: argparse.Namespace):
                 protocols.append("BGP")
             logger.info(f"✓ Route redistribution enabled ({' ↔ '.join(protocols)})")
 
+        # Compute ASI ID early (needed by BFD, agentic bridge, etc.)
+        asi_id = args.asi_id if args.asi_id else f"asi-{args.router_id.replace('.', '-')}"
+
         # Initialize BFD Manager (Bidirectional Forwarding Detection)
         # BFD provides fast failure detection for OSPF, BGP, and other protocols
         bfd_manager = None
@@ -2179,9 +2217,6 @@ async def run_unified_agent(args: argparse.Namespace):
             logger.warning("No LLM API keys provided. ASI will work but won't have AI responses. "
                          "Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY environment variables "
                          "or use --openai-key, --claude-key, or --gemini-key flags.")
-
-        # Determine ASI ID
-        asi_id = args.asi_id if args.asi_id else f"asi-{args.router_id.replace('.', '-')}"
 
         # Create agentic bridge
         bridge = AgenticBridge(

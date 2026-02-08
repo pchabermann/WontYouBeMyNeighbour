@@ -288,15 +288,15 @@ class GREManager:
         # Set packet callback
         tunnel.set_packet_callback(self._on_tunnel_packet)
 
+        # Store tunnel before starting (so it shows in dashboard even if start fails)
+        self._tunnels[config.name] = tunnel
+        self._tunnels_by_endpoint[endpoint_key] = tunnel
+
         # Start tunnel
         success = await tunnel.start()
         if not success:
             self.logger.error(f"Failed to start tunnel {config.name}")
-            return None
-
-        # Store tunnel
-        self._tunnels[config.name] = tunnel
-        self._tunnels_by_endpoint[endpoint_key] = tunnel
+            return tunnel  # Return the tunnel object (state=FAILED) so caller knows it exists
 
         # Notify callback
         if self._tunnel_up_callback:
@@ -351,6 +351,10 @@ class GREManager:
             if tunnel.config.remote_ip == remote_ip:
                 return tunnel
         return None
+
+    def get_tunnels(self) -> list:
+        """Get all tunnel objects"""
+        return list(self._tunnels.values())
 
     def list_tunnels(self) -> List[Dict[str, Any]]:
         """List all tunnels with status"""
